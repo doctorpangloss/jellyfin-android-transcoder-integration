@@ -14,9 +14,13 @@ git submodule update --init --recursive
 dotnet test JellyfinAndroidTranscoderIntegration.sln
 ```
 
-The .NET tests use Testcontainers to start a real Jellyfin container and verify
-its public API is reachable. They also include a mock Android transcoder server
-that accepts the same HTTP request shape the Jellyfin shim sends to the APK.
+The .NET tests use Testcontainers to start a real Jellyfin container with the
+Android Transcoder plugin installed in `/config/plugins`. The plugin is expected
+to configure Jellyfin's FFmpeg path during startup. A mock Android transcoder is
+then exposed to the container, and the test executes the installed shim with a
+Jellyfin-style HLS ffmpeg command. The assertions verify that the shim writes the
+playlist and segment files Jellyfin waits for, routes the request to Android, and
+does not fall back to local ffmpeg for that transcode.
 
 For Android end-to-end testing, build the AAB in
 `third_party/jellyfin-android-transcoder`, generate installable APK sets with
