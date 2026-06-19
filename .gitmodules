@@ -1,0 +1,7 @@
+[submodule "third_party/ffmpeg-android"]
+	path = third_party/ffmpeg-android
+	url = https://github.com/doctorpangloss/forks-ffmpeg-android.git
+	branch = mediacodec-surface-hwframes
+[submodule "third_party/jellyfin-android-transcoder"]
+	path = third_party/jellyfin-android-transcoder
+	url = https://github.com/doctorpangloss/jellyfin-android-transcoder.git
