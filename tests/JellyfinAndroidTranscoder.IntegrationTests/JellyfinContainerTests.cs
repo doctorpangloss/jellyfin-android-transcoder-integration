@@ -1,28 +1,62 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Json;
 using System.Net.Sockets;
 using DotNet.Testcontainers.Builders;
+using DotNet.Testcontainers.Configurations;
 using DotNet.Testcontainers.Containers;
 
 namespace JellyfinAndroidTranscoder.IntegrationTests;
 
 public sealed class JellyfinContainerTests : IAsyncLifetime
 {
-    private readonly IContainer _jellyfin = new ContainerBuilder()
-        .WithImage("jellyfin/jellyfin:10.11.0")
-        .WithPortBinding(8096, true)
-        .WithWaitStrategy(Wait.ForUnixContainer()
-            .UntilHttpRequestIsSucceeded(request => request
-                .ForPort(8096)
-                .ForPath("/System/Info/Public")))
-        .Build();
+    private const string ShimPath = "/config/plugins/Jellyfin.Plugin.AndroidTranscoder/shim/jfat-ffmpeg";
+
+    private readonly string _workDir;
+    private readonly IContainer _jellyfin;
+
+    public JellyfinContainerTests()
+    {
+        _workDir = Path.Combine(Path.GetTempPath(), "jfat-integration-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(_workDir);
+
+        var configDir = Path.Combine(_workDir, "config");
+        var cacheDir = Path.Combine(_workDir, "cache");
+        var pluginDir = Path.Combine(configDir, "plugins", "Android Transcoder_1.0.0");
+        Directory.CreateDirectory(configDir);
+        Directory.CreateDirectory(cacheDir);
+
+        AssemblePlugin(pluginDir);
+
+        _jellyfin = new ContainerBuilder()
+            .WithImage("jellyfin/jellyfin:10.11.6")
+            .WithEnvironment("JELLYFIN_FFMPEG", "/usr/lib/jellyfin-ffmpeg/ffmpeg")
+            .WithBindMount(configDir, "/config")
+            .WithBindMount(cacheDir, "/cache")
+            .WithPortBinding(8096, true)
+            .WithWaitStrategy(Wait.ForUnixContainer()
+                .UntilHttpRequestIsSucceeded(request => request
+                    .ForPort(8096)
+                    .ForPath("/health")))
+            .Build();
+    }
 
     public Task InitializeAsync() => _jellyfin.StartAsync();
 
-    public Task DisposeAsync() => _jellyfin.DisposeAsync().AsTask();
+    public async Task DisposeAsync()
+    {
+        await _jellyfin.DisposeAsync();
+        try
+        {
+            Directory.Delete(_workDir, recursive: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+        }
+    }
 
     [Fact]
-    public async Task JellyfinContainerStartsAndExposesPublicInfo()
+    public async Task InstalledPluginConfiguresShimBeforeJellyfinValidatesFfmpeg()
     {
         using HttpClient client = new()
         {
@@ -35,8 +69,117 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
         JellyfinPublicInfo? info = await response.Content.ReadFromJsonAsync<JellyfinPublicInfo>(
             cancellationToken: CancellationToken.None);
 
-        Assert.False(string.IsNullOrWhiteSpace(info?.ServerName));
-        Assert.False(string.IsNullOrWhiteSpace(info?.Version));
+        Assert.Equal("10.11.6", info?.Version);
+
+        var logs = await WaitForLogAsync("Core startup complete", TimeSpan.FromSeconds(60));
+        Assert.Contains("Loaded plugin: Android Transcoder", logs);
+        Assert.Contains($"Android Transcoder configured Jellyfin FFmpeg path to {ShimPath}", logs);
+        Assert.Contains($"FFmpeg: {ShimPath}", logs);
+        Assert.DoesNotContain("FFmpeg: /usr/lib/jellyfin-ffmpeg/ffmpeg", logs);
+    }
+
+    private async Task<string> WaitForLogAsync(string marker, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        string logs = string.Empty;
+        while (DateTime.UtcNow < deadline)
+        {
+            var containerLogs = await _jellyfin.GetLogsAsync(DateTime.UnixEpoch, DateTime.UtcNow, false, CancellationToken.None);
+            logs = containerLogs.Stdout + containerLogs.Stderr;
+            if (logs.Contains(marker, StringComparison.Ordinal))
+            {
+                return logs;
+            }
+
+            await Task.Delay(500);
+        }
+
+        return logs;
+    }
+
+    private static void AssemblePlugin(string pluginDir)
+    {
+        var repoRoot = FindRepoRoot();
+        var componentRoot = Path.Combine(repoRoot, "third_party", "jellyfin-android-transcoder", "jellyfin-android-transcoder");
+        var shimProject = Path.Combine(componentRoot, "src", "JellyfinAndroidTranscoder.Shim", "JellyfinAndroidTranscoder.Shim.csproj");
+        var pluginProject = Path.Combine(componentRoot, "src", "Jellyfin.Plugin.AndroidTranscoder", "Jellyfin.Plugin.AndroidTranscoder.csproj");
+        var publishRoot = Path.Combine(Path.GetTempPath(), "jfat-publish-" + Guid.NewGuid().ToString("N"));
+        var shimOut = Path.Combine(publishRoot, "shim");
+        var pluginOut = Path.Combine(publishRoot, "plugin");
+
+        try
+        {
+            RunDotnet("publish", shimProject, "-c", "Release", "-o", shimOut);
+            RunDotnet("publish", pluginProject, "-c", "Release", "-o", pluginOut);
+
+            Directory.CreateDirectory(pluginDir);
+            File.Copy(Path.Combine(pluginOut, "Jellyfin.Plugin.AndroidTranscoder.dll"),
+                Path.Combine(pluginDir, "Jellyfin.Plugin.AndroidTranscoder.dll"),
+                overwrite: true);
+
+            var shimPayloadDir = Path.Combine(pluginDir, "shim-payload");
+            Directory.CreateDirectory(shimPayloadDir);
+            var shimTarget = Path.Combine(shimPayloadDir, "jfat-ffmpeg");
+            File.Copy(Path.Combine(shimOut, "jfat-ffmpeg"), shimTarget, overwrite: true);
+            if (!OperatingSystem.IsWindows())
+            {
+                File.SetUnixFileMode(shimTarget,
+                    UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute |
+                    UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+                    UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(publishRoot))
+            {
+                Directory.Delete(publishRoot, recursive: true);
+            }
+        }
+    }
+
+    private static string FindRepoRoot()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null)
+        {
+            if (Directory.Exists(Path.Combine(dir.FullName, "third_party", "jellyfin-android-transcoder")))
+            {
+                return dir.FullName;
+            }
+
+            dir = dir.Parent;
+        }
+
+        throw new DirectoryNotFoundException("Could not find integration repository root.");
+    }
+
+    private static void RunDotnet(params string[] args)
+    {
+        using var process = new Process
+        {
+            StartInfo = new ProcessStartInfo("dotnet")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false
+            }
+        };
+
+        foreach (var arg in args)
+        {
+            process.StartInfo.ArgumentList.Add(arg);
+        }
+
+        process.Start();
+        var stdout = process.StandardOutput.ReadToEnd();
+        var stderr = process.StandardError.ReadToEnd();
+        process.WaitForExit();
+
+        if (process.ExitCode != 0)
+        {
+            throw new InvalidOperationException($"dotnet {string.Join(' ', args)} failed with exit code {process.ExitCode}\n{stdout}\n{stderr}");
+        }
     }
 
     private sealed record JellyfinPublicInfo(string? ServerName, string? Version);
