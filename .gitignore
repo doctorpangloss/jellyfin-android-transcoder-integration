@@ -6,4 +6,5 @@
 **/obj/
 artifacts/
 work/
+.work/
 TestResults/
