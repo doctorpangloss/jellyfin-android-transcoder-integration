@@ -15,11 +15,13 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
     private const string AndroidToken = "test-token";
     private const int AndroidForwardPort = 18098;
     private const int AndroidBridgePort = 18099;
+    private const long LargeFixtureMinimumBytes = 5L * 1024L * 1024L;
     private const string ShimPath = "/config/plugins/Jellyfin.Plugin.AndroidTranscoder/shim/jfat-ffmpeg";
 
     private readonly string _repoRoot = FindRepoRoot();
     private readonly string _workDir;
     private readonly string _configDir;
+    private readonly string _mediaPath;
     private readonly IContainer _jellyfin;
     private Process? _emulator;
     private TcpBridge? _androidBridge;
@@ -40,7 +42,8 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         Directory.CreateDirectory(androidTestDir);
         Directory.CreateDirectory(pluginConfigurationsDir);
 
-        CreateHevcFixture(Path.Combine(mediaDir, "browser-emulator-hevc.mkv"));
+        _mediaPath = Path.Combine(mediaDir, "browser-emulator-large-hevc.mkv");
+        CreateLargeHevcFixture(_mediaPath);
         WriteFailingFfmpeg(Path.Combine(androidTestDir, "fail-ffmpeg.sh"));
         AssemblePlugin(pluginDir);
         WritePluginConfiguration(
@@ -88,8 +91,13 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task BrowserPlaybackRequestsJellyfinHlsSegmentFromAndroidEmulator()
+    public async Task BrowserPlaybackTranscodesLargeHevcFileThroughAndroidEmulator()
     {
+        var fixtureSize = new FileInfo(_mediaPath).Length;
+        Assert.True(
+            fixtureSize >= LargeFixtureMinimumBytes,
+            $"Expected a large enough HEVC fixture for streaming validation, got {fixtureSize} bytes.");
+
         var baseUrl = new Uri($"http://127.0.0.1:{_jellyfin.GetMappedPublicPort(8096)}");
         using var client = new HttpClient { BaseAddress = baseUrl };
         await WaitForLogAsync("Core startup complete", TimeSpan.FromSeconds(90));
@@ -97,6 +105,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("MediaBrowser", $"Token=\"{auth.AccessToken}\"");
 
         var before = await GetAndroidAcceptedJobs();
+        var beforeInputBytes = await GetAndroidInputBytes();
         var item = await WaitForMovie(client, auth.User.Id);
         var playback = await GetPlaybackInfo(client, item.Id, auth.User.Id);
         var transcodingUrl = playback.MediaSources[0].TranscodingUrl
@@ -121,6 +130,11 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
 
         var after = await WaitForAndroidAcceptedJobs(before);
         Assert.True(after > before, $"Expected Android acceptedJobs to increase, before={before}, after={after}");
+
+        var afterInputBytes = await WaitForAndroidInputBytes(beforeInputBytes + LargeFixtureMinimumBytes);
+        Assert.True(
+            afterInputBytes - beforeInputBytes >= LargeFixtureMinimumBytes,
+            $"Expected Android to consume at least {LargeFixtureMinimumBytes} bytes from the remote stdin stream, before={beforeInputBytes}, after={afterInputBytes}, fixture={fixtureSize}.");
     }
 
     private async Task<AuthResult> ConfigureJellyfin(HttpClient client)
@@ -314,6 +328,15 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         return document.RootElement.GetProperty("acceptedJobs").GetInt32();
     }
 
+    private static async Task<long> GetAndroidInputBytes()
+    {
+        using var client = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{AndroidForwardPort}") };
+        using var response = await client.GetAsync("/api/v1/status");
+        response.EnsureSuccessStatusCode();
+        using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        return document.RootElement.GetProperty("inputBytes").GetInt64();
+    }
+
     private static async Task<int> WaitForAndroidAcceptedJobs(int before)
     {
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
@@ -329,6 +352,23 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         }
 
         return await GetAndroidAcceptedJobs();
+    }
+
+    private static async Task<long> WaitForAndroidInputBytes(long minimum)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        while (DateTime.UtcNow < deadline)
+        {
+            var inputBytes = await GetAndroidInputBytes();
+            if (inputBytes >= minimum)
+            {
+                return inputBytes;
+            }
+
+            await Task.Delay(1000);
+        }
+
+        return await GetAndroidInputBytes();
     }
 
     private static void BuildAndInstallAndroidApp()
@@ -357,16 +397,25 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
             "no\n");
     }
 
-    private static void CreateHevcFixture(string path)
+    private static void CreateLargeHevcFixture(string path)
     {
         RunProcess("ffmpeg",
             [
                 "-hide_banner", "-loglevel", "error",
-                "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=24",
-                "-t", "1", "-c:v", "libx265", "-pix_fmt", "yuv420p",
+                "-f", "lavfi", "-i", "testsrc2=size=960x540:rate=24",
+                "-t", "12",
+                "-c:v", "libx265", "-preset", "ultrafast",
+                "-b:v", "6M", "-maxrate", "6M", "-bufsize", "12M",
+                "-x265-params", "keyint=48:min-keyint=48:scenecut=0",
+                "-pix_fmt", "yuv420p",
                 "-an", "-f", "matroska", path, "-y"
             ],
             FindRepoRoot());
+        var size = new FileInfo(path).Length;
+        if (size < LargeFixtureMinimumBytes)
+        {
+            throw new InvalidOperationException($"Generated HEVC fixture is too small: {size} bytes.");
+        }
     }
 
     private static void WriteFailingFfmpeg(string path)
