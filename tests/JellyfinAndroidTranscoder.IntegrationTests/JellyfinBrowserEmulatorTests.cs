@@ -15,7 +15,8 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
     private const string AndroidToken = "test-token";
     private const int AndroidForwardPort = 18098;
     private const int AndroidBridgePort = 18099;
-    private const long LargeFixtureMinimumBytes = 5L * 1024L * 1024L;
+    private const long LargeFixtureMinimumBytes = 1L * 1024L * 1024L * 1024L;
+    private const long StartupReadCeilingBytes = 128L * 1024L * 1024L;
     private const string ShimPath = "/config/plugins/Jellyfin.Plugin.AndroidTranscoder/shim/jfat-ffmpeg";
 
     private readonly string _repoRoot = FindRepoRoot();
@@ -42,7 +43,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         Directory.CreateDirectory(androidTestDir);
         Directory.CreateDirectory(pluginConfigurationsDir);
 
-        _mediaPath = Path.Combine(mediaDir, "browser-emulator-large-hevc.mkv");
+        _mediaPath = Path.Combine(mediaDir, "browser-emulator-large-hevc.mp4");
         CreateLargeHevcFixture(_mediaPath);
         WriteFailingFfmpeg(Path.Combine(androidTestDir, "fail-ffmpeg.sh"));
         AssemblePlugin(pluginDir);
@@ -116,13 +117,22 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         await using var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions { Headless = true });
         var page = await browser.NewPageAsync();
 
+        var startup = Stopwatch.StartNew();
         var playlist = await BrowserFetchText(page, playlistUrl);
         Assert.Contains("#EXTM3U", playlist);
 
         var segmentUrl = await ResolveFirstSegment(page, playlistUrl, playlist);
         var segment = await BrowserFetchBytes(page, segmentUrl);
+        startup.Stop();
         Assert.True(segment.Length > 0, "The browser should receive an HLS segment from Jellyfin.");
         Assert.Equal(0x47, segment[0]);
+        Assert.True(
+            startup.Elapsed < TimeSpan.FromSeconds(10),
+            $"Expected browser-visible HLS media to start within 10s, took {startup.Elapsed}.");
+        var startupInputBytes = await GetAndroidInputBytes();
+        Assert.True(
+            startupInputBytes - beforeInputBytes < StartupReadCeilingBytes,
+            $"Expected HLS startup before a full upload; Android consumed {startupInputBytes - beforeInputBytes} bytes before the first segment from a {fixtureSize} byte fixture.");
 
         var logs = await WaitForFileLogAsync("jfat: routing", TimeSpan.FromSeconds(30));
         Assert.DoesNotContain("jfat: fallback", logs);
@@ -131,10 +141,10 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         var after = await WaitForAndroidAcceptedJobs(before);
         Assert.True(after > before, $"Expected Android acceptedJobs to increase, before={before}, after={after}");
 
-        var afterInputBytes = await WaitForAndroidInputBytes(beforeInputBytes + LargeFixtureMinimumBytes);
+        var afterInputBytes = await GetAndroidInputBytes();
         Assert.True(
-            afterInputBytes - beforeInputBytes >= LargeFixtureMinimumBytes,
-            $"Expected Android to consume at least {LargeFixtureMinimumBytes} bytes from the remote stdin stream, before={beforeInputBytes}, after={afterInputBytes}, fixture={fixtureSize}.");
+            afterInputBytes - beforeInputBytes < StartupReadCeilingBytes,
+            $"Expected the remote process path to avoid eagerly uploading the whole 1 GiB fixture, before={beforeInputBytes}, after={afterInputBytes}, fixture={fixtureSize}.");
     }
 
     private async Task<AuthResult> ConfigureJellyfin(HttpClient client)
@@ -354,23 +364,6 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         return await GetAndroidAcceptedJobs();
     }
 
-    private static async Task<long> WaitForAndroidInputBytes(long minimum)
-    {
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
-        while (DateTime.UtcNow < deadline)
-        {
-            var inputBytes = await GetAndroidInputBytes();
-            if (inputBytes >= minimum)
-            {
-                return inputBytes;
-            }
-
-            await Task.Delay(1000);
-        }
-
-        return await GetAndroidInputBytes();
-    }
-
     private static void BuildAndInstallAndroidApp()
     {
         var appRoot = Path.Combine(FindRepoRoot(), "third_party", "jellyfin-android-transcoder", "android-transcoder");
@@ -408,14 +401,29 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
                 "-b:v", "6M", "-maxrate", "6M", "-bufsize", "12M",
                 "-x265-params", "keyint=48:min-keyint=48:scenecut=0",
                 "-pix_fmt", "yuv420p",
-                "-an", "-f", "matroska", path, "-y"
+                "-an",
+                "-movflags", "+faststart",
+                "-tag:v", "hvc1",
+                "-f", "mp4", path, "-y"
             ],
             FindRepoRoot());
+        AppendTrailingPadding(path, LargeFixtureMinimumBytes);
         var size = new FileInfo(path).Length;
         if (size < LargeFixtureMinimumBytes)
         {
             throw new InvalidOperationException($"Generated HEVC fixture is too small: {size} bytes.");
         }
+    }
+
+    private static void AppendTrailingPadding(string path, long targetSize)
+    {
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        if (stream.Length >= targetSize)
+        {
+            return;
+        }
+
+        stream.SetLength(targetSize);
     }
 
     private static void WriteFailingFfmpeg(string path)
