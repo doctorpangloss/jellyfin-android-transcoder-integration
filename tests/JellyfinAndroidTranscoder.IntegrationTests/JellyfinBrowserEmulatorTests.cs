@@ -1,8 +1,11 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
+using System.Text;
 using System.Text.Json;
 using DotNet.Testcontainers.Builders;
 using DotNet.Testcontainers.Containers;
@@ -145,6 +148,94 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         Assert.True(
             afterInputBytes - beforeInputBytes < StartupReadCeilingBytes,
             $"Expected the remote process path to avoid eagerly uploading the whole 1 GiB fixture, before={beforeInputBytes}, after={afterInputBytes}, fixture={fixtureSize}.");
+    }
+
+    [Fact]
+    public async Task AndroidEmulatorStartsFmp4OutputBeforeLargeUploadCompletes()
+    {
+        var beforeInputBytes = await GetAndroidInputBytes();
+        var beforeAccepted = await GetAndroidAcceptedJobs();
+        var remoteArgs = EncodeRemoteArgs([
+            "-hide_banner",
+            "-loglevel", "warning",
+            "-init_hw_device", "mediacodec=mc,create_window=1,surface_processor=1",
+            "-hwaccel", "mediacodec",
+            "-hwaccel_device", "mc",
+            "-hwaccel_output_format", "mediacodec",
+            "-i", "{input}",
+            "-t", "12",
+            "-map", "0:v:0",
+            "-c:v", "h264_mediacodec",
+            "-pix_fmt", "mediacodec",
+            "-output_width", "960",
+            "-output_height", "540",
+            "-surface_tonemap", "0",
+            "-b:v", "600000",
+            "-maxrate", "600000",
+            "-bufsize", "1200000",
+            "-bitrate_mode", "cbr",
+            "-g", "24",
+            "-an",
+            "-sn",
+            "-dn",
+            "-f", "hls",
+            "-hls_time", "1",
+            "-hls_flags", "temp_file",
+            "-hls_segment_type", "fmp4",
+            "-hls_segment_filename", "{outputRoot}/direct%d.mp4",
+            "-start_number", "0",
+            "-hls_fmp4_init_filename", "direct-1.mp4",
+            "-hls_segment_options", "movflags=+frag_discont",
+            "-hls_playlist_type", "vod",
+            "-hls_list_size", "0",
+            "-y", "{outputRoot}/direct.m3u8"
+        ]);
+
+        await using var input = File.OpenRead(_mediaPath);
+        var startup = Stopwatch.StartNew();
+        RawRemoteProcessExchange exchange;
+        try
+        {
+            exchange = await RawRemoteProcessExchange.Start(
+                AndroidForwardPort,
+                AndroidToken,
+                remoteArgs,
+                new RateLimitedStream(input, 8L * 1024L * 1024L),
+                TimeSpan.FromSeconds(10));
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException("Android closed the remote process request before response headers. Status: " + await GetAndroidStatusText(), ex);
+        }
+
+        await using (exchange)
+        {
+            byte[] firstMedia;
+            try
+            {
+                firstMedia = await ReadUntilRemoteFile(
+                    exchange.ResponseBody,
+                    exchange.Boundary,
+                    (path, bytes) => path.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase) && bytes.Length > 0,
+                    TimeSpan.FromSeconds(10));
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException("Expected non-empty fMP4 output before upload completed. Status: " + await GetAndroidStatusText(), ex);
+            }
+            startup.Stop();
+            Assert.True(firstMedia.Length > 0, "Expected fMP4 init/media bytes from Android before upload completed. Status: " + await GetAndroidStatusText());
+            Assert.True(
+                startup.Elapsed < TimeSpan.FromSeconds(10),
+                $"Expected Android fMP4 output within 10s, took {startup.Elapsed}. Status: {await GetAndroidStatusText()}");
+        }
+
+        var afterAccepted = await GetAndroidAcceptedJobs();
+        Assert.True(afterAccepted > beforeAccepted, $"Expected Android to accept a remote process, before={beforeAccepted}, after={afterAccepted}");
+        var afterInputBytes = await GetAndroidInputBytes();
+        Assert.True(
+            afterInputBytes - beforeInputBytes < LargeFixtureMinimumBytes,
+            $"The test must observe output before the full large upload completes; uploaded={afterInputBytes - beforeInputBytes}, fixture={LargeFixtureMinimumBytes}.");
     }
 
     private async Task<AuthResult> ConfigureJellyfin(HttpClient client)
@@ -300,6 +391,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
             }
             await Task.Delay(2000);
         }
+        await WaitForAdbReady();
 
         BuildAndInstallAndroidApp();
         RunAdb(["-s", "emulator-5554", "shell", "pm", "grant", "com.hiddenswitch.androidtranscoder", "android.permission.POST_NOTIFICATIONS"], allowFailure: true);
@@ -329,6 +421,24 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         throw new TimeoutException("Timed out waiting for Android transcoder status endpoint.");
     }
 
+    private static async Task WaitForAdbReady()
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(60);
+        while (DateTime.UtcNow < deadline)
+        {
+            var state = RunAdb(["-s", "emulator-5554", "get-state"], allowFailure: true).Trim();
+            var packageManager = RunAdb(["-s", "emulator-5554", "shell", "pm", "path", "android"], allowFailure: true).Trim();
+            if (state == "device" && packageManager.StartsWith("package:", StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            await Task.Delay(1000);
+        }
+
+        throw new TimeoutException("Timed out waiting for emulator ADB/package manager readiness.");
+    }
+
     private static async Task<int> GetAndroidAcceptedJobs()
     {
         using var client = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{AndroidForwardPort}") };
@@ -345,6 +455,147 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         response.EnsureSuccessStatusCode();
         using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
         return document.RootElement.GetProperty("inputBytes").GetInt64();
+    }
+
+    private static async Task<string> GetAndroidStatusText()
+    {
+        using var client = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{AndroidForwardPort}") };
+        using var response = await client.GetAsync("/api/v1/status");
+        return await response.Content.ReadAsStringAsync();
+    }
+
+    private static string EncodeRemoteArgs(IReadOnlyList<string> args)
+    {
+        var json = JsonSerializer.Serialize(args);
+        return Convert.ToBase64String(Encoding.UTF8.GetBytes(json))
+            .TrimEnd('=')
+            .Replace('+', '-')
+            .Replace('/', '_');
+    }
+
+    private static string Boundary(string contentType)
+    {
+        const string marker = "boundary=";
+        var index = contentType.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+        if (index < 0)
+        {
+            throw new InvalidOperationException("Multipart response is missing boundary: " + contentType);
+        }
+
+        var boundary = contentType[(index + marker.Length)..].Trim();
+        if (boundary.Length >= 2 && boundary[0] == '"' && boundary[^1] == '"')
+        {
+            boundary = boundary[1..^1];
+        }
+        return boundary;
+    }
+
+    private static async Task<byte[]> ReadUntilRemoteFile(Stream body, string boundary, Func<string, byte[], bool> predicate, TimeSpan timeout)
+    {
+        using var cts = new CancellationTokenSource(timeout);
+        await foreach (var part in ReadMultipart(body, boundary, cts.Token))
+        {
+            if (predicate(part.Path, part.Body))
+            {
+                return part.Body;
+            }
+        }
+
+        throw new TimeoutException("Multipart stream ended before matching remote file arrived.");
+    }
+
+    private static async IAsyncEnumerable<RemotePart> ReadMultipart(
+        Stream stream,
+        string boundary,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var boundaryLine = "--" + boundary;
+        while (true)
+        {
+            var line = await ReadAsciiLine(stream, cancellationToken);
+            if (line == null)
+            {
+                yield break;
+            }
+            if (line == boundaryLine)
+            {
+                break;
+            }
+        }
+
+        while (true)
+        {
+            var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            string? line;
+            while (!string.IsNullOrEmpty(line = await ReadAsciiLine(stream, cancellationToken)))
+            {
+                var colon = line.IndexOf(':');
+                if (colon > 0)
+                {
+                    headers[line[..colon].Trim()] = line[(colon + 1)..].Trim();
+                }
+            }
+
+            if (!headers.TryGetValue("Content-Length", out var lengthText) || !int.TryParse(lengthText, out var length))
+            {
+                throw new InvalidOperationException("Multipart part missing Content-Length.");
+            }
+
+            var body = new byte[length];
+            await ReadExact(stream, body, cancellationToken);
+            await ReadAsciiLine(stream, cancellationToken);
+
+            var next = await ReadAsciiLine(stream, cancellationToken);
+            var path = headers.TryGetValue("X-Remote-Path", out var remotePath) ? remotePath : "";
+            yield return new RemotePart(path, body);
+
+            if (next == boundaryLine + "--" || next == null)
+            {
+                yield break;
+            }
+            if (next != boundaryLine)
+            {
+                throw new InvalidOperationException("Unexpected multipart boundary: " + next);
+            }
+        }
+    }
+
+    private static async Task ReadExact(Stream stream, byte[] buffer, CancellationToken cancellationToken)
+    {
+        var offset = 0;
+        while (offset < buffer.Length)
+        {
+            var read = await stream.ReadAsync(buffer.AsMemory(offset, buffer.Length - offset), cancellationToken);
+            if (read == 0)
+            {
+                throw new EndOfStreamException();
+            }
+            offset += read;
+        }
+    }
+
+    private static async Task<string?> ReadAsciiLine(Stream stream, CancellationToken cancellationToken)
+    {
+        var bytes = new List<byte>();
+        while (true)
+        {
+            var buffer = new byte[1];
+            var read = await stream.ReadAsync(buffer, cancellationToken);
+            if (read == 0)
+            {
+                return bytes.Count == 0 ? null : Encoding.ASCII.GetString(bytes.ToArray());
+            }
+            var b = buffer[0];
+            if (b == '\n')
+            {
+                if (bytes.Count > 0 && bytes[^1] == '\r')
+                {
+                    bytes.RemoveAt(bytes.Count - 1);
+                }
+                return Encoding.ASCII.GetString(bytes.ToArray());
+            }
+            bytes.Add(b);
+        }
     }
 
     private static async Task<int> WaitForAndroidAcceptedJobs(int before)
@@ -600,6 +851,132 @@ exit 42
     private sealed record MovieItem(string Id);
     private sealed record PlaybackInfo(PlaybackMediaSource[] MediaSources);
     private sealed record PlaybackMediaSource(string? TranscodingUrl);
+    private sealed record RemotePart(string Path, byte[] Body);
+
+    private sealed class RawRemoteProcessExchange : IAsyncDisposable
+    {
+        private readonly HttpClient _client;
+        private readonly HttpResponseMessage _filesResponse;
+        private readonly Task<HttpResponseMessage> _uploadTask;
+
+        private RawRemoteProcessExchange(HttpClient client, HttpResponseMessage filesResponse, Stream responseBody, string boundary, Task<HttpResponseMessage> uploadTask)
+        {
+            _client = client;
+            _filesResponse = filesResponse;
+            ResponseBody = responseBody;
+            Boundary = boundary;
+            _uploadTask = uploadTask;
+        }
+
+        public Stream ResponseBody { get; }
+        public string Boundary { get; }
+
+        public static async Task<RawRemoteProcessExchange> Start(int port, string token, string remoteArgs, Stream requestBody, TimeSpan timeout)
+        {
+            using var cts = new CancellationTokenSource(timeout);
+            var client = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{port}"), Timeout = Timeout.InfiniteTimeSpan };
+            using var start = new HttpRequestMessage(HttpMethod.Post, "/api/v1/remoteprocesses");
+            start.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            start.Headers.TryAddWithoutValidation("X-Remote-Split", "1");
+            start.Headers.TryAddWithoutValidation("X-Remote-Executable", "ffmpeg");
+            start.Headers.TryAddWithoutValidation("X-Remote-Args", remoteArgs);
+            using var startResponse = await client.SendAsync(start, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            startResponse.EnsureSuccessStatusCode();
+            using var document = JsonDocument.Parse(await startResponse.Content.ReadAsStringAsync(cts.Token));
+            var stdinUrl = document.RootElement.GetProperty("stdinUrl").GetString()
+                ?? throw new InvalidOperationException("Missing stdinUrl");
+            var filesUrl = document.RootElement.GetProperty("filesUrl").GetString()
+                ?? throw new InvalidOperationException("Missing filesUrl");
+
+            var stdin = new HttpRequestMessage(HttpMethod.Put, stdinUrl);
+            stdin.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            stdin.Content = new StreamContent(requestBody);
+            stdin.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+            var uploadTask = client.SendAsync(stdin, HttpCompletionOption.ResponseHeadersRead);
+
+            var files = new HttpRequestMessage(HttpMethod.Get, filesUrl);
+            files.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            var filesResponse = await client.SendAsync(files, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+            filesResponse.EnsureSuccessStatusCode();
+            var body = await filesResponse.Content.ReadAsStreamAsync(cts.Token);
+            var boundary = Boundary(filesResponse.Content.Headers.ContentType?.ToString()
+                ?? throw new InvalidOperationException("Missing multipart content type"));
+            return new RawRemoteProcessExchange(client, filesResponse, body, boundary, uploadTask);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            _filesResponse.Dispose();
+            try
+            {
+                using var uploadResponse = await _uploadTask.WaitAsync(TimeSpan.FromSeconds(2));
+                uploadResponse.EnsureSuccessStatusCode();
+            }
+            catch
+            {
+            }
+            _client.Dispose();
+        }
+    }
+
+    private sealed class RateLimitedStream : Stream
+    {
+        private readonly Stream _inner;
+        private readonly long _bytesPerSecond;
+        private long _bytesThisWindow;
+        private long _windowStarted = Stopwatch.GetTimestamp();
+
+        public RateLimitedStream(Stream inner, long bytesPerSecond)
+        {
+            _inner = inner;
+            _bytesPerSecond = bytesPerSecond;
+        }
+
+        public override bool CanRead => _inner.CanRead;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => _inner.Length;
+        public override long Position
+        {
+            get => _inner.Position;
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush() => throw new NotSupportedException();
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var allowed = (int)Math.Min(buffer.Length, 64 * 1024);
+            await Throttle(allowed, cancellationToken);
+            return await _inner.ReadAsync(buffer[..allowed], cancellationToken);
+        }
+
+        private async Task Throttle(int nextReadBytes, CancellationToken cancellationToken)
+        {
+            var elapsed = Stopwatch.GetElapsedTime(_windowStarted);
+            if (elapsed >= TimeSpan.FromSeconds(1))
+            {
+                _windowStarted = Stopwatch.GetTimestamp();
+                _bytesThisWindow = 0;
+                elapsed = TimeSpan.Zero;
+            }
+
+            if (_bytesThisWindow + nextReadBytes > _bytesPerSecond)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1) - elapsed, cancellationToken);
+                _windowStarted = Stopwatch.GetTimestamp();
+                _bytesThisWindow = 0;
+            }
+            _bytesThisWindow += nextReadBytes;
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
 
     private sealed class TcpBridge : IDisposable
     {

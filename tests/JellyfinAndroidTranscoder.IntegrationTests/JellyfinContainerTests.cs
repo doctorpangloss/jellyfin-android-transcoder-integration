@@ -128,7 +128,7 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
         Assert.Contains("segment0.ts", playlist.Stdout);
         Assert.Equal(MockAndroidTranscoder.ExpectedOutputText, segment.Stdout);
         Assert.Equal("", fallbackLog.Stdout);
-        Assert.Equal("/api/v1/remoteprocesses", _android.LastPath);
+        Assert.Contains(_android.LastPath, new[] { "/api/v1/remoteprocesses/job-1/stdin", "/api/v1/remoteprocesses/job-1/files" });
         Assert.Equal("ffmpeg", _android.LastExecutable);
         Assert.Contains("{outputRoot}/segment%d.ts", _android.LastRemoteArgs);
         Assert.Contains("{outputRoot}/playlist.m3u8", _android.LastRemoteArgs);
@@ -379,24 +379,37 @@ public sealed class AndroidTranscoderContractTests
     {
         await using MockAndroidTranscoder transcoder = await MockAndroidTranscoder.StartAsync();
         using HttpClient client = new();
+
+        using HttpRequestMessage start = new(HttpMethod.Post, transcoder.BaseUri + "api/v1/remoteprocesses");
+        start.Headers.Authorization = new("Bearer", transcoder.Token);
+        start.Headers.TryAddWithoutValidation("X-Remote-Split", "1");
+        start.Headers.TryAddWithoutValidation("X-Remote-Executable", "ffmpeg");
+        start.Headers.TryAddWithoutValidation("X-Remote-Args", Convert.ToBase64String(Encoding.UTF8.GetBytes("""["-version"]""")).TrimEnd('=').Replace('+', '-').Replace('/', '_'));
+        using HttpResponseMessage startResponse = await client.SendAsync(start, CancellationToken.None);
+        startResponse.EnsureSuccessStatusCode();
+        using var document = System.Text.Json.JsonDocument.Parse(await startResponse.Content.ReadAsStringAsync(CancellationToken.None));
+        var stdinUrl = document.RootElement.GetProperty("stdinUrl").GetString();
+        var filesUrl = document.RootElement.GetProperty("filesUrl").GetString();
+
         using Stream input = new MemoryStream(new byte[] { 0x47, 0x40, 0x00, 0x10 });
         using StreamContent content = new(input);
-
         content.Headers.ContentType = new("video/mp2t");
-        using HttpRequestMessage request = new(HttpMethod.Post,
-            transcoder.BaseUri + "api/v1/remoteprocesses");
-        request.Headers.Authorization = new("Bearer", transcoder.Token);
-        request.Headers.TryAddWithoutValidation("X-Remote-Executable", "ffmpeg");
-        request.Headers.TryAddWithoutValidation("X-Remote-Args", Convert.ToBase64String(Encoding.UTF8.GetBytes("""["-version"]""")).TrimEnd('=').Replace('+', '-').Replace('/', '_'));
-        request.Content = content;
+        using HttpRequestMessage stdin = new(HttpMethod.Put, new Uri(transcoder.BaseUri, stdinUrl));
+        stdin.Headers.Authorization = new("Bearer", transcoder.Token);
+        stdin.Content = content;
+        var stdinTask = client.SendAsync(stdin, CancellationToken.None);
 
-        using HttpResponseMessage response = await client.SendAsync(request, CancellationToken.None);
+        using HttpRequestMessage files = new(HttpMethod.Get, new Uri(transcoder.BaseUri, filesUrl));
+        files.Headers.Authorization = new("Bearer", transcoder.Token);
+        using HttpResponseMessage response = await client.SendAsync(files, CancellationToken.None);
         string output = await response.Content.ReadAsStringAsync(CancellationToken.None);
+        using var stdinResponse = await stdinTask;
+        stdinResponse.EnsureSuccessStatusCode();
 
         response.EnsureSuccessStatusCode();
         Assert.Equal("multipart/mixed", response.Content.Headers.ContentType?.MediaType);
         Assert.Contains(MockAndroidTranscoder.ExpectedOutputText, output);
-        Assert.Equal("/api/v1/remoteprocesses", transcoder.LastPath);
+        Assert.Equal("/api/v1/remoteprocesses/job-1/files", transcoder.LastPath);
         Assert.Equal("ffmpeg", transcoder.LastExecutable);
         Assert.Equal(4, transcoder.LastBodyLength);
     }
@@ -505,9 +518,16 @@ internal sealed class MockAndroidTranscoder : IAsyncDisposable
             return;
         }
 
-        LastPath = context.Request.Url?.AbsolutePath;
-        LastExecutable = context.Request.Headers["X-Remote-Executable"] ?? "";
-        LastRemoteArgs = DecodeArgs(context.Request.Headers["X-Remote-Args"] ?? "");
+        var path = context.Request.Url?.AbsolutePath ?? "";
+        LastPath = path;
+        if (!string.IsNullOrEmpty(context.Request.Headers["X-Remote-Executable"]))
+        {
+            LastExecutable = context.Request.Headers["X-Remote-Executable"] ?? "";
+        }
+        if (!string.IsNullOrEmpty(context.Request.Headers["X-Remote-Args"]))
+        {
+            LastRemoteArgs = DecodeArgs(context.Request.Headers["X-Remote-Args"] ?? "");
+        }
         LastQuery.Clear();
         foreach (string? key in context.Request.QueryString.AllKeys)
         {
@@ -517,7 +537,32 @@ internal sealed class MockAndroidTranscoder : IAsyncDisposable
             }
         }
 
-        var drainTask = DrainAsync(context.Request.InputStream);
+        if (path == "/api/v1/remoteprocesses" && context.Request.HttpMethod == "POST")
+        {
+            var body = Encoding.UTF8.GetBytes("""{"id":"job-1","stdinUrl":"/api/v1/remoteprocesses/job-1/stdin","filesUrl":"/api/v1/remoteprocesses/job-1/files"}""");
+            context.Response.ContentType = "application/json";
+            context.Response.ContentLength64 = body.Length;
+            await context.Response.OutputStream.WriteAsync(body);
+            context.Response.Close();
+            return;
+        }
+
+        if (path == "/api/v1/remoteprocesses/job-1/stdin" && context.Request.HttpMethod == "PUT")
+        {
+            LastBodyLength = await DrainAsync(context.Request.InputStream);
+            context.Response.ContentType = "application/json";
+            await context.Response.OutputStream.WriteAsync("{}"u8.ToArray());
+            context.Response.Close();
+            return;
+        }
+
+        if (path != "/api/v1/remoteprocesses/job-1/files" || context.Request.HttpMethod != "GET")
+        {
+            context.Response.StatusCode = 404;
+            context.Response.Close();
+            return;
+        }
+
         var boundary = "mock-boundary";
         context.Response.ContentType = "multipart/mixed; boundary=" + boundary;
         context.Response.SendChunked = true;
@@ -525,7 +570,6 @@ internal sealed class MockAndroidTranscoder : IAsyncDisposable
         await WritePart(context.Response.OutputStream, boundary, "segment0.ts", ExpectedOutput);
         await context.Response.OutputStream.WriteAsync(Encoding.ASCII.GetBytes($"--{boundary}\r\nContent-Type: application/json\r\nX-Remote-Event: exit\r\nContent-Length: 14\r\n\r\n{{\"exitCode\":0}}\r\n--{boundary}--\r\n"));
         await context.Response.OutputStream.FlushAsync();
-        LastBodyLength = await drainTask;
         context.Response.Close();
     }
 
