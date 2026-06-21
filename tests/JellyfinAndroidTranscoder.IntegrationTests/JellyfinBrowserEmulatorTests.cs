@@ -304,7 +304,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         BuildAndInstallAndroidApp();
         RunAdb(["-s", "emulator-5554", "shell", "pm", "grant", "com.hiddenswitch.androidtranscoder", "android.permission.POST_NOTIFICATIONS"], allowFailure: true);
         RunAdb(["-s", "emulator-5554", "shell", "am", "force-stop", "com.hiddenswitch.androidtranscoder"], allowFailure: true);
-        RunAdb(["-s", "emulator-5554", "shell", "am", "start", "-n", "com.hiddenswitch.androidtranscoder/.MainActivity", "--es", "token", AndroidToken, "--ez", "startService", "true"]);
+        RunAdb(["-s", "emulator-5554", "shell", "am", "start-foreground-service", "-n", "com.hiddenswitch.androidtranscoder/.TranscoderService", "--es", "token", AndroidToken, "--ez", "startOnBoot", "true", "--ez", "keepAwake", "true"]);
         RunAdb(["-s", "emulator-5554", "forward", "--remove", $"tcp:{AndroidForwardPort}"], allowFailure: true);
         RunAdb(["-s", "emulator-5554", "forward", $"tcp:{AndroidForwardPort}", "tcp:8098"]);
 

@@ -135,6 +135,46 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
         Assert.True(_android.LastBodyLength > 0);
     }
 
+    [Fact]
+    public async Task InstalledPluginCanPairAndroidWorkerThroughJellyfinEndpoint()
+    {
+        await WaitForLogAsync("Core startup complete", TimeSpan.FromSeconds(60));
+
+        using HttpClient client = new()
+        {
+            BaseAddress = new Uri($"http://127.0.0.1:{_jellyfin.GetMappedPublicPort(8096)}")
+        };
+
+        using var pairingResponse = await client.PostAsync("/AndroidTranscoder/Pairing", null, CancellationToken.None);
+        pairingResponse.EnsureSuccessStatusCode();
+        using var pairingDocument = System.Text.Json.JsonDocument.Parse(await pairingResponse.Content.ReadAsStringAsync(CancellationToken.None));
+        var code = pairingDocument.RootElement.GetProperty("code").GetString();
+        Assert.False(string.IsNullOrWhiteSpace(code));
+
+        using var pairResponse = await client.PostAsJsonAsync(
+            "/AndroidTranscoder/Pair/" + code,
+            new
+            {
+                baseUrl = "http://host.docker.internal:" + _android.Port,
+                allBaseUrls = new[]
+                {
+                    "http://192.0.2.1:8098",
+                    "http://host.docker.internal:" + _android.Port
+                },
+                maxBitrate = 6000000
+            },
+            CancellationToken.None);
+        pairResponse.EnsureSuccessStatusCode();
+
+        using var pairDocument = System.Text.Json.JsonDocument.Parse(await pairResponse.Content.ReadAsStringAsync(CancellationToken.None));
+        Assert.True(pairDocument.RootElement.GetProperty("ok").GetBoolean());
+        Assert.Equal("http://host.docker.internal:" + _android.Port, pairDocument.RootElement.GetProperty("androidBaseUrl").GetString());
+
+        var shimConfig = await AssertContainerSuccess(["cat", "/config/plugins/Jellyfin.Plugin.AndroidTranscoder/shim/shim-config.json"]);
+        Assert.Contains("host.docker.internal:" + _android.Port, shimConfig.Stdout);
+        Assert.Contains(_android.Token, shimConfig.Stdout);
+    }
+
     private async Task<ExecResult> AssertContainerSuccess(IList<string> command)
     {
         var result = await _jellyfin.ExecAsync(command, CancellationToken.None);
