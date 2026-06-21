@@ -1,29 +1,74 @@
 # Jellyfin Android Transcoder Integration
 
-Integration harness for the Jellyfin Android Transcoder project.
+Integration harness for the Android MediaCodec transcode bridge for Jellyfin.
 
-This repository intentionally keeps build configuration in the component repos:
+Related repositories:
 
-- `third_party/ffmpeg-android`: FFmpeg fork with Android MediaCodec zero-copy work.
-- `third_party/jellyfin-android-transcoder`: Android App Bundle, Jellyfin plugin, and FFmpeg shim.
+- Android worker + Jellyfin plugin: https://github.com/doctorpangloss/jellyfin-android-transcoder
+- Patched FFmpeg fork: https://github.com/doctorpangloss/forks-ffmpeg-android
+- Integration tests: https://github.com/doctorpangloss/jellyfin-android-transcoder-integration
 
-Run:
+## What This Tests
+
+The integration suite validates the deployed shape rather than only unit-level code:
+
+- Builds the Jellyfin plugin and `jfat-ffmpeg` shim from the component submodule.
+- Builds the Android app bundle and installs it on an Android emulator.
+- Starts Jellyfin `10.11.6` with Testcontainers.
+- Installs the plugin into Jellyfin's `/config/plugins` volume.
+- Writes the plugin configuration into Jellyfin's `/config/plugins/configurations` volume.
+- Adds a large HEVC media fixture to the Jellyfin library.
+- Uses Chromium/Playwright to request playback through Jellyfin.
+- Verifies Jellyfin invokes the shim and the shim routes work to Android.
+- Verifies browser-visible HLS media starts within 10 seconds.
+- Verifies Android does not consume/upload the full 1 GiB source before first media output.
+
+The large fixture is intentionally sparse: it is a valid short HEVC MP4 extended to 1 GiB. That proves startup streaming behavior without spending minutes generating or copying a full 1 GiB encoded movie.
+
+## Prerequisites
+
+- Docker with Testcontainers support.
+- .NET SDK 9.
+- JDK 21.
+- Android SDK with an API 35 x86_64 emulator image.
+- `bundletool` at `/home/administrator/Documents/tools/bundletool/bundletool-all-1.18.3.jar`, or update `Bundletool()` in the test.
+
+## Run
 
 ```bash
 git submodule update --init --recursive
-dotnet test JellyfinAndroidTranscoderIntegration.sln
+dotnet test JellyfinAndroidTranscoderIntegration.sln --nologo
 ```
 
-The .NET tests use Testcontainers to start a real Jellyfin container with the
-Android Transcoder plugin installed in `/config/plugins`. The plugin is expected
-to configure Jellyfin's FFmpeg path during startup. A mock Android transcoder is
-then exposed to the container, and the test executes the installed shim with a
-Jellyfin-style HLS ffmpeg command. The assertions verify that the shim writes the
-playlist and segment files Jellyfin waits for, routes the request to Android, and
-does not fall back to local ffmpeg for that transcode.
+Focused browser/emulator test:
 
-For Android end-to-end testing, build the AAB in
-`third_party/jellyfin-android-transcoder`, generate installable APK sets with
-`bundletool`, then install them on either a physical phone or an x86_64 Android
-Emulator instance. The emulator is the right Linux/Windows automation target;
-an Android application cannot be started as a normal Linux process.
+```bash
+dotnet test tests/JellyfinAndroidTranscoder.IntegrationTests/JellyfinAndroidTranscoder.IntegrationTests.csproj \
+  --filter FullyQualifiedName~JellyfinBrowserEmulatorTests \
+  --nologo
+```
+
+If the emulator is wedged, restart it:
+
+```bash
+$ANDROID_HOME/platform-tools/adb -s emulator-5554 emu kill || true
+```
+
+The test will recreate/start the `jfat_api35` AVD if needed.
+
+## Deployment Relevance
+
+This repo is not installed on production systems. It exists to prove that the release artifacts in `doctorpangloss/jellyfin-android-transcoder` work together with Jellyfin and Android as deployed components.
+
+For actual deployment, use the `v1.0.0` release assets from:
+
+```text
+https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/tag/v1.0.0
+```
+
+Install:
+
+- `jellyfin-android-transcoder-1.0.0.apk` or `jellyfin-android-transcoder-1.0.0.aab` on the Android phone.
+- `Jellyfin.Plugin.AndroidTranscoder-1.0.0.zip` on the Jellyfin server.
+
+The component repository README contains the Docker Compose and ADB/sideload deployment instructions.
