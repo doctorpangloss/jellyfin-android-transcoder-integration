@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Http.Json;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using DotNet.Testcontainers.Builders;
 using DotNet.Testcontainers.Configurations;
 using DotNet.Testcontainers.Containers;
@@ -382,9 +383,7 @@ public sealed class AndroidTranscoderContractTests
 
         using HttpRequestMessage start = new(HttpMethod.Post, transcoder.BaseUri + "api/v1/remoteprocesses");
         start.Headers.Authorization = new("Bearer", transcoder.Token);
-        start.Headers.TryAddWithoutValidation("X-Remote-Split", "1");
-        start.Headers.TryAddWithoutValidation("X-Remote-Executable", "ffmpeg");
-        start.Headers.TryAddWithoutValidation("X-Remote-Args", Convert.ToBase64String(Encoding.UTF8.GetBytes("""["-version"]""")).TrimEnd('=').Replace('+', '-').Replace('/', '_'));
+        start.Content = JsonContent.Create(new { executable = "ffmpeg", args = new[] { "-version" } });
         using HttpResponseMessage startResponse = await client.SendAsync(start, CancellationToken.None);
         startResponse.EnsureSuccessStatusCode();
         using var document = System.Text.Json.JsonDocument.Parse(await startResponse.Content.ReadAsStringAsync(CancellationToken.None));
@@ -539,6 +538,7 @@ internal sealed class MockAndroidTranscoder : IAsyncDisposable
 
         if (path == "/api/v1/remoteprocesses" && context.Request.HttpMethod == "POST")
         {
+            await CaptureRemoteProcessRequest(context.Request);
             var body = Encoding.UTF8.GetBytes("""{"id":"job-1","stdinUrl":"/api/v1/remoteprocesses/job-1/stdin","filesUrl":"/api/v1/remoteprocesses/job-1/files"}""");
             context.Response.ContentType = "application/json";
             context.Response.ContentLength64 = body.Length;
@@ -571,6 +571,37 @@ internal sealed class MockAndroidTranscoder : IAsyncDisposable
         await context.Response.OutputStream.WriteAsync(Encoding.ASCII.GetBytes($"--{boundary}\r\nContent-Type: application/json\r\nX-Remote-Event: exit\r\nContent-Length: 14\r\n\r\n{{\"exitCode\":0}}\r\n--{boundary}--\r\n"));
         await context.Response.OutputStream.FlushAsync();
         context.Response.Close();
+    }
+
+    private async Task CaptureRemoteProcessRequest(HttpListenerRequest request)
+    {
+        if (request.HasEntityBody)
+        {
+            using var reader = new StreamReader(request.InputStream, request.ContentEncoding ?? Encoding.UTF8);
+            var body = await reader.ReadToEndAsync();
+            if (!string.IsNullOrWhiteSpace(body))
+            {
+                using var document = JsonDocument.Parse(body);
+                if (document.RootElement.TryGetProperty("executable", out var executable))
+                {
+                    LastExecutable = executable.GetString() ?? "";
+                }
+                if (document.RootElement.TryGetProperty("args", out var args))
+                {
+                    LastRemoteArgs = args.GetRawText();
+                }
+                return;
+            }
+        }
+
+        if (!string.IsNullOrEmpty(request.Headers["X-Remote-Executable"]))
+        {
+            LastExecutable = request.Headers["X-Remote-Executable"] ?? "";
+        }
+        if (!string.IsNullOrEmpty(request.Headers["X-Remote-Args"]))
+        {
+            LastRemoteArgs = DecodeArgs(request.Headers["X-Remote-Args"] ?? "");
+        }
     }
 
     private static async Task WritePart(Stream output, string boundary, string path, byte[] body)

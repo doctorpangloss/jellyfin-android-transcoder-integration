@@ -13,7 +13,7 @@ Related repositories:
 The integration suite validates the deployed shape rather than only unit-level code:
 
 - Builds the Jellyfin plugin and `jfat-ffmpeg` shim from the component submodule.
-- Builds the Android app bundle and installs it on an Android emulator.
+- Builds the Android app bundle and installs it on an Android emulator by default, or on a real ADB device when configured.
 - Starts Jellyfin `10.11.6` with Testcontainers.
 - Installs the plugin into Jellyfin's `/config/plugins` volume.
 - Writes the plugin configuration into Jellyfin's `/config/plugins/configurations` volume.
@@ -23,7 +23,7 @@ The integration suite validates the deployed shape rather than only unit-level c
 - Verifies browser-visible HLS media starts within 10 seconds.
 - Verifies Android does not consume/upload the full 1 GiB source before first media output.
 
-The large fixture is intentionally sparse: it is a valid short HEVC MP4 extended to 1 GiB. That proves startup streaming behavior without spending minutes generating or copying a full 1 GiB encoded movie.
+The large fixture is intentionally sparse: it is a valid short HEVC MPEG-TS stream extended to 1 GiB. That proves startup streaming behavior without spending minutes generating or copying a full 1 GiB encoded movie, while still allowing ffmpeg to read from stdin without seeking.
 
 ## Prerequisites
 
@@ -55,6 +55,20 @@ $ANDROID_HOME/platform-tools/adb -s emulator-5554 emu kill || true
 ```
 
 The test will recreate/start the `jfat_api35` AVD if needed.
+
+To run the same Jellyfin/browser flow against a real Android device and exercise the hardware MediaCodec path, connect the device with ADB first, then set:
+
+```bash
+export JFAT_ANDROID_TARGET=real
+export JFAT_ANDROID_CONNECT=192.168.88.99:5555   # optional, for wireless ADB
+export JFAT_ANDROID_SERIAL=DEVICE_SERIAL         # optional, only needed if multiple real devices are connected
+
+dotnet test tests/JellyfinAndroidTranscoder.IntegrationTests/JellyfinAndroidTranscoder.IntegrationTests.csproj \
+  --filter FullyQualifiedName~JellyfinBrowserEmulatorTests \
+  --nologo
+```
+
+When `JFAT_ANDROID_TARGET=real`, the test installs the same app bundle on the selected device, forwards local port `18098` to the app's port `8098`, starts the foreground service with the test token, and writes the Jellyfin plugin configuration with `UseHardwareCodecs=true`.
 
 ## Deployment Relevance
 

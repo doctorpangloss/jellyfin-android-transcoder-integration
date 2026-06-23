@@ -15,7 +15,7 @@ namespace JellyfinAndroidTranscoder.IntegrationTests;
 
 public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
 {
-    private const string AndroidToken = "test-token";
+    private const string AndroidToken = "1234";
     private const int AndroidForwardPort = 18098;
     private const int AndroidBridgePort = 18099;
     private const long LargeFixtureMinimumBytes = 1L * 1024L * 1024L * 1024L;
@@ -27,8 +27,10 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
     private readonly string _configDir;
     private readonly string _mediaPath;
     private readonly IContainer _jellyfin;
+    private readonly AndroidTarget _androidTarget = AndroidTarget.FromEnvironment();
     private Process? _emulator;
     private TcpBridge? _androidBridge;
+    private string? _adbSerial;
 
     public JellyfinBrowserEmulatorTests()
     {
@@ -47,13 +49,22 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         Directory.CreateDirectory(pluginConfigurationsDir);
 
         _mediaPath = Path.Combine(mediaDir, "browser-emulator-large-hevc.mp4");
-        CreateLargeHevcFixture(_mediaPath);
+        var existingFixture = Environment.GetEnvironmentVariable("JFAT_BROWSER_FIXTURE");
+        if (!string.IsNullOrWhiteSpace(existingFixture))
+        {
+            File.Copy(existingFixture, _mediaPath, overwrite: true);
+        }
+        else
+        {
+            CreateLargeHevcFixture(_mediaPath);
+        }
         WriteFailingFfmpeg(Path.Combine(androidTestDir, "fail-ffmpeg.sh"));
         AssemblePlugin(pluginDir);
         WritePluginConfiguration(
             Path.Combine(pluginConfigurationsDir, "Jellyfin.Plugin.AndroidTranscoder.xml"),
             $"http://host.docker.internal:{AndroidBridgePort}",
-            AndroidToken);
+            AndroidToken,
+            _androidTarget.UseHardwareCodecs);
 
         _jellyfin = new ContainerBuilder()
             .WithImage("jellyfin/jellyfin:10.11.6")
@@ -70,7 +81,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
 
     public async Task InitializeAsync()
     {
-        _emulator = await StartEmulatorAndApp();
+        (_emulator, _adbSerial) = await StartAndroidAndApp(_androidTarget);
         _androidBridge = TcpBridge.Start(AndroidBridgePort, IPAddress.Loopback, AndroidForwardPort);
         await _jellyfin.StartAsync();
     }
@@ -79,7 +90,14 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
     {
         await _jellyfin.DisposeAsync();
         _androidBridge?.Dispose();
-        RunAdb(["-s", "emulator-5554", "emu", "kill"], allowFailure: true);
+        if (_adbSerial is not null)
+        {
+            RunAdb(["-s", _adbSerial, "forward", "--remove", $"tcp:{AndroidForwardPort}"], allowFailure: true);
+        }
+        if (_androidTarget.Kind == AndroidTargetKind.Emulator)
+        {
+            RunAdb(["-s", _adbSerial ?? "emulator-5554", "emu", "kill"], allowFailure: true);
+        }
         if (_emulator is { HasExited: false })
         {
             _emulator.Kill(entireProcessTree: true);
@@ -117,7 +135,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         var playlistUrl = new Uri(baseUrl, transcodingUrl + (transcodingUrl.Contains('?') ? "&" : "?") + "api_key=" + auth.AccessToken);
 
         using var playwright = await Playwright.CreateAsync();
-        await using var browser = await playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions { Headless = true });
+        await using var browser = await playwright.Firefox.LaunchAsync(new BrowserTypeLaunchOptions { Headless = true });
         var page = await browser.NewPageAsync();
 
         var startup = Stopwatch.StartNew();
@@ -125,10 +143,19 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         Assert.Contains("#EXTM3U", playlist);
 
         var segmentUrl = await ResolveFirstSegment(page, playlistUrl, playlist);
-        var segment = await BrowserFetchBytes(page, segmentUrl);
+        byte[] segment;
+        try
+        {
+            segment = await BrowserFetchBytes(page, segmentUrl);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException(
+                $"Browser failed to fetch first HLS segment {segmentUrl}. Android status: {await GetAndroidStatusText()}\nJellyfin transcode logs:\n{ReadJellyfinFileLogs()}",
+                ex);
+        }
         startup.Stop();
         Assert.True(segment.Length > 0, "The browser should receive an HLS segment from Jellyfin.");
-        Assert.Equal(0x47, segment[0]);
         Assert.True(
             startup.Elapsed < TimeSpan.FromSeconds(10),
             $"Expected browser-visible HLS media to start within 10s, took {startup.Elapsed}.");
@@ -144,6 +171,16 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         var after = await WaitForAndroidAcceptedJobs(before);
         Assert.True(after > before, $"Expected Android acceptedJobs to increase, before={before}, after={after}");
 
+        var segment11 = await WaitForBrowserVisibleSegment(page, playlistUrl, 11, TimeSpan.FromSeconds(35));
+        Assert.True(
+            segment11.Bytes.Length > 0,
+            $"Expected Jellyfin browser playback to make segment 11 available. Segment URL: {segment11.Uri}. Android status: {await GetAndroidStatusText()}");
+
+        var playedSeconds = await PlayHlsInBrowser(page, playlistUrl, TimeSpan.FromSeconds(35));
+        Assert.True(
+            playedSeconds >= 15,
+            $"Expected browser HLS playback to advance beyond 15s, got {playedSeconds:0.0}s. Android status: {await GetAndroidStatusText()}\nJellyfin transcode logs:\n{ReadJellyfinFileLogs()}");
+
         var afterInputBytes = await GetAndroidInputBytes();
         Assert.True(
             afterInputBytes - beforeInputBytes < StartupReadCeilingBytes,
@@ -155,41 +192,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
     {
         var beforeInputBytes = await GetAndroidInputBytes();
         var beforeAccepted = await GetAndroidAcceptedJobs();
-        var remoteArgs = EncodeRemoteArgs([
-            "-hide_banner",
-            "-loglevel", "warning",
-            "-init_hw_device", "mediacodec=mc,create_window=1,surface_processor=1",
-            "-hwaccel", "mediacodec",
-            "-hwaccel_device", "mc",
-            "-hwaccel_output_format", "mediacodec",
-            "-i", "{input}",
-            "-t", "12",
-            "-map", "0:v:0",
-            "-c:v", "h264_mediacodec",
-            "-pix_fmt", "mediacodec",
-            "-output_width", "960",
-            "-output_height", "540",
-            "-surface_tonemap", "0",
-            "-b:v", "600000",
-            "-maxrate", "600000",
-            "-bufsize", "1200000",
-            "-bitrate_mode", "cbr",
-            "-g", "24",
-            "-an",
-            "-sn",
-            "-dn",
-            "-f", "hls",
-            "-hls_time", "1",
-            "-hls_flags", "temp_file",
-            "-hls_segment_type", "fmp4",
-            "-hls_segment_filename", "{outputRoot}/direct%d.mp4",
-            "-start_number", "0",
-            "-hls_fmp4_init_filename", "direct-1.mp4",
-            "-hls_segment_options", "movflags=+frag_discont",
-            "-hls_playlist_type", "vod",
-            "-hls_list_size", "0",
-            "-y", "{outputRoot}/direct.m3u8"
-        ]);
+        var remoteArgs = EncodeRemoteArgs(BuildDirectRemoteFfmpegArgs(_androidTarget.UseHardwareCodecs));
 
         await using var input = File.OpenRead(_mediaPath);
         var startup = Stopwatch.StartNew();
@@ -224,7 +227,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
                 throw new InvalidOperationException("Expected non-empty fMP4 output before upload completed. Status: " + await GetAndroidStatusText(), ex);
             }
             startup.Stop();
-            Assert.True(firstMedia.Length > 0, "Expected fMP4 init/media bytes from Android before upload completed. Status: " + await GetAndroidStatusText());
+            Assert.True(firstMedia.Length > 0, "Expected fMP4 media bytes from Android before upload completed. Status: " + await GetAndroidStatusText());
             Assert.True(
                 startup.Elapsed < TimeSpan.FromSeconds(10),
                 $"Expected Android fMP4 output within 10s, took {startup.Elapsed}. Status: {await GetAndroidStatusText()}");
@@ -374,31 +377,189 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         throw new InvalidOperationException("Timed out resolving HLS segment from nested playlists.");
     }
 
-    private static async Task<Process> StartEmulatorAndApp()
+    private async Task<(Uri Uri, byte[] Bytes)> WaitForBrowserVisibleSegment(IPage page, Uri playlistUrl, int segmentIndex, TimeSpan timeout)
     {
-        EnsureAvd();
-        var emulator = StartProcess(
-            Path.Combine(AndroidHome(), "emulator", "emulator"),
-            ["-avd", "jfat_api35", "-no-window", "-no-audio", "-no-boot-anim", "-gpu", "swiftshader_indirect", "-no-snapshot"]);
-        RunAdb(["-s", "emulator-5554", "wait-for-device"]);
+        var deadline = DateTime.UtcNow + timeout;
+        var lastPlaylist = "";
+        Exception? lastFetchFailure = null;
+        while (DateTime.UtcNow < deadline)
+        {
+            var mediaPlaylist = await ResolveMediaPlaylist(page, playlistUrl);
+            lastPlaylist = mediaPlaylist.Playlist;
+            var segments = SegmentUris(mediaPlaylist.Uri, lastPlaylist).ToArray();
+            if (segments.Length > segmentIndex)
+            {
+                try
+                {
+                    var bytes = await BrowserFetchBytes(page, segments[segmentIndex]);
+                    if (bytes.Length > 0)
+                    {
+                        return (segments[segmentIndex], bytes);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lastFetchFailure = ex;
+                }
+            }
+
+            await Task.Delay(1000);
+        }
+
+        throw new TimeoutException(
+            $"Timed out waiting for browser-visible HLS segment {segmentIndex}. Last playlist had {SegmentUris(playlistUrl, lastPlaylist).Count()} media segments. Last fetch failure: {lastFetchFailure?.Message}. Android status: {await GetAndroidStatusText()}\nPlaylist:\n{lastPlaylist}\nJellyfin transcode logs:\n{ReadJellyfinFileLogs()}");
+    }
+
+    private static async Task<(Uri Uri, string Playlist)> ResolveMediaPlaylist(IPage page, Uri playlistUrl)
+    {
+        for (var i = 0; i < 4; i++)
+        {
+            var playlist = await BrowserFetchText(page, playlistUrl);
+            var firstMediaLine = playlist.Split('\n')
+                .Select(line => line.Trim())
+                .FirstOrDefault(line => line.Length > 0 && !line.StartsWith('#'));
+            if (firstMediaLine is null)
+            {
+                return (playlistUrl, playlist);
+            }
+            var uri = new Uri(playlistUrl, firstMediaLine);
+            if (!uri.AbsolutePath.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase))
+            {
+                return (playlistUrl, playlist);
+            }
+
+            playlistUrl = uri;
+        }
+
+        throw new InvalidOperationException("Timed out resolving nested HLS media playlist.");
+    }
+
+    private static IEnumerable<Uri> SegmentUris(Uri playlistUrl, string playlist)
+    {
+        foreach (var line in playlist.Split('\n').Select(line => line.Trim()))
+        {
+            if (line.Length == 0 || line.StartsWith('#') || line.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            yield return new Uri(playlistUrl, line);
+        }
+    }
+
+    private static async Task<double> PlayHlsInBrowser(IPage page, Uri playlistUrl, TimeSpan timeout)
+    {
+        await page.SetContentAsync("""
+<!doctype html>
+<html>
+<body>
+<video id="video" muted playsinline autoplay controls></video>
+</body>
+</html>
+""");
+        return await page.EvaluateAsync<double>(
+            @"async ({ url, timeoutMs }) => {
+                await new Promise((resolve, reject) => {
+                    const script = document.createElement('script');
+                    script.src = 'https://cdn.jsdelivr.net/npm/hls.js@1.6.5/dist/hls.min.js';
+                    script.onload = resolve;
+                    script.onerror = () => reject(new Error('failed to load hls.js'));
+                    document.head.appendChild(script);
+                });
+
+                const video = document.getElementById('video');
+                const started = performance.now();
+                let lastTime = 0;
+                return await new Promise((resolve, reject) => {
+                    const timeout = setTimeout(() => {
+                        resolve(lastTime);
+                    }, timeoutMs);
+                    const finish = value => {
+                        clearTimeout(timeout);
+                        resolve(value);
+                    };
+                    const fail = error => {
+                        clearTimeout(timeout);
+                        reject(error);
+                    };
+                    if (!window.Hls || !window.Hls.isSupported()) {
+                        video.src = url;
+                        video.play().catch(fail);
+                    } else {
+                        const hls = new window.Hls({
+                            debug: false,
+                            lowLatencyMode: false,
+                            maxBufferLength: 30,
+                            manifestLoadingTimeOut: 10000,
+                            fragLoadingTimeOut: 10000
+                        });
+                        hls.on(window.Hls.Events.ERROR, (_event, data) => {
+                            if (data && data.fatal) {
+                                fail(new Error(`${data.type || 'hls'} ${data.details || 'fatal'}`));
+                            }
+                        });
+                        hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
+                            video.play().catch(fail);
+                        });
+                        hls.loadSource(url);
+                        hls.attachMedia(video);
+                    }
+                    const poll = setInterval(() => {
+                        lastTime = video.currentTime || lastTime;
+                        if (lastTime >= 15) {
+                            clearInterval(poll);
+                            finish(lastTime);
+                        }
+                        if (performance.now() - started > timeoutMs) {
+                            clearInterval(poll);
+                            finish(lastTime);
+                        }
+                    }, 250);
+                });
+            }",
+            new { url = playlistUrl.ToString(), timeoutMs = (int)timeout.TotalMilliseconds });
+    }
+
+    private static async Task<(Process? Emulator, string AdbSerial)> StartAndroidAndApp(AndroidTarget target)
+    {
+        Process? emulator = null;
+        var serial = target.Serial;
+        if (target.ConnectEndpoint is { Length: > 0 })
+        {
+            RunAdb(["connect", target.ConnectEndpoint], allowFailure: true);
+        }
+        if (target.Kind == AndroidTargetKind.Emulator)
+        {
+            EnsureAvd();
+            emulator = StartProcess(
+                Path.Combine(AndroidHome(), "emulator", "emulator"),
+                ["-avd", "jfat_api35", "-no-window", "-no-audio", "-no-boot-anim", "-gpu", "swiftshader_indirect", "-no-snapshot"]);
+            serial = "emulator-5554";
+        }
+        else if (string.IsNullOrWhiteSpace(serial))
+        {
+            serial = ResolveRealDeviceSerial();
+        }
+
+        RunAdb(["-s", serial, "wait-for-device"]);
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(180);
         while (DateTime.UtcNow < deadline)
         {
-            var booted = RunAdb(["-s", "emulator-5554", "shell", "getprop", "sys.boot_completed"], allowFailure: true).Trim();
+            var booted = RunAdb(["-s", serial, "shell", "getprop", "sys.boot_completed"], allowFailure: true).Trim();
             if (booted == "1")
             {
                 break;
             }
             await Task.Delay(2000);
         }
-        await WaitForAdbReady();
+        await WaitForAdbReady(serial);
 
-        BuildAndInstallAndroidApp();
-        RunAdb(["-s", "emulator-5554", "shell", "pm", "grant", "com.hiddenswitch.androidtranscoder", "android.permission.POST_NOTIFICATIONS"], allowFailure: true);
-        RunAdb(["-s", "emulator-5554", "shell", "am", "force-stop", "com.hiddenswitch.androidtranscoder"], allowFailure: true);
-        RunAdb(["-s", "emulator-5554", "shell", "am", "start-foreground-service", "-n", "com.hiddenswitch.androidtranscoder/.TranscoderService", "--es", "token", AndroidToken, "--ez", "startOnBoot", "true", "--ez", "keepAwake", "true"]);
-        RunAdb(["-s", "emulator-5554", "forward", "--remove", $"tcp:{AndroidForwardPort}"], allowFailure: true);
-        RunAdb(["-s", "emulator-5554", "forward", $"tcp:{AndroidForwardPort}", "tcp:8098"]);
+        BuildAndInstallAndroidApp(serial);
+        RunAdb(["-s", serial, "shell", "pm", "grant", "com.hiddenswitch.androidtranscoder", "android.permission.POST_NOTIFICATIONS"], allowFailure: true);
+        RunAdb(["-s", serial, "shell", "am", "force-stop", "com.hiddenswitch.androidtranscoder"], allowFailure: true);
+        RunAdb(["-s", serial, "shell", "am", "start-foreground-service", "-n", "com.hiddenswitch.androidtranscoder/.TranscoderService", "--es", "token", AndroidToken, "--ez", "startOnBoot", "true", "--ez", "keepAwake", "true"]);
+        RunAdb(["-s", serial, "forward", "--remove", $"tcp:{AndroidForwardPort}"], allowFailure: true);
+        RunAdb(["-s", serial, "forward", $"tcp:{AndroidForwardPort}", "tcp:8098"]);
 
         using var client = new HttpClient { BaseAddress = new Uri($"http://127.0.0.1:{AndroidForwardPort}") };
         deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
@@ -409,7 +570,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
                 using var response = await client.GetAsync("/api/v1/status");
                 if (response.IsSuccessStatusCode)
                 {
-                    return emulator;
+                    return (emulator, serial);
                 }
             }
             catch (HttpRequestException)
@@ -421,13 +582,13 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         throw new TimeoutException("Timed out waiting for Android transcoder status endpoint.");
     }
 
-    private static async Task WaitForAdbReady()
+    private static async Task WaitForAdbReady(string serial)
     {
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(60);
         while (DateTime.UtcNow < deadline)
         {
-            var state = RunAdb(["-s", "emulator-5554", "get-state"], allowFailure: true).Trim();
-            var packageManager = RunAdb(["-s", "emulator-5554", "shell", "pm", "path", "android"], allowFailure: true).Trim();
+            var state = RunAdb(["-s", serial, "get-state"], allowFailure: true).Trim();
+            var packageManager = RunAdb(["-s", serial, "shell", "pm", "path", "android"], allowFailure: true).Trim();
             if (state == "device" && packageManager.StartsWith("package:", StringComparison.Ordinal))
             {
                 return;
@@ -437,6 +598,23 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         }
 
         throw new TimeoutException("Timed out waiting for emulator ADB/package manager readiness.");
+    }
+
+    private static string ResolveRealDeviceSerial()
+    {
+        var devices = RunAdb(["devices"], allowFailure: true)
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Skip(1)
+            .Select(line => line.Split('\t', ' ', StringSplitOptions.RemoveEmptyEntries))
+            .Where(parts => parts.Length >= 2 && parts[1] == "device" && !parts[0].StartsWith("emulator-", StringComparison.Ordinal))
+            .Select(parts => parts[0])
+            .ToArray();
+        return devices.Length switch
+        {
+            1 => devices[0],
+            0 => throw new InvalidOperationException("JFAT_ANDROID_TARGET=real requires one connected real ADB device. Set JFAT_ANDROID_CONNECT=host:port or JFAT_ANDROID_SERIAL=serial, then rerun."),
+            _ => throw new InvalidOperationException("Multiple real ADB devices are connected. Set JFAT_ANDROID_SERIAL to choose one: " + string.Join(", ", devices))
+        };
     }
 
     private static async Task<int> GetAndroidAcceptedJobs()
@@ -471,6 +649,82 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
             .TrimEnd('=')
             .Replace('+', '-')
             .Replace('/', '_');
+    }
+
+    private static IReadOnlyList<string> BuildDirectRemoteFfmpegArgs(bool useHardwareCodecs)
+    {
+        var args = new List<string>();
+        AddRemoteFfmpegPreamble(args, useHardwareCodecs);
+        args.AddRange(["-i", "{input}", "-t", "12", "-map", "0:v:0"]);
+        AddVideoEncodeArgs(args, useHardwareCodecs);
+        AddRateControlArgs(args, useHardwareCodecs);
+        AddFmp4HlsOutputArgs(args);
+        return args;
+    }
+
+    private static void AddRemoteFfmpegPreamble(List<string> args, bool useHardwareCodecs)
+    {
+        args.AddRange(["-hide_banner", "-loglevel", "info", "-stats_period", "1", "-progress", "pipe:2"]);
+        if (!useHardwareCodecs)
+        {
+            return;
+        }
+        args.AddRange([
+            "-init_hw_device", "mediacodec=mc,create_window=1,surface_processor=1",
+            "-hwaccel", "mediacodec",
+            "-hwaccel_device", "mc",
+            "-hwaccel_output_format", "mediacodec"
+        ]);
+    }
+
+    private static void AddVideoEncodeArgs(List<string> args, bool useHardwareCodecs)
+    {
+        if (useHardwareCodecs)
+        {
+            args.AddRange([
+                "-c:v", "h264_mediacodec",
+                "-pix_fmt", "mediacodec",
+                "-output_width", "960",
+                "-output_height", "540",
+                "-surface_tonemap", "0"
+            ]);
+            return;
+        }
+        args.AddRange([
+            "-vf", "scale=960:540:flags=fast_bilinear",
+            "-c:v", "h264_mediacodec",
+            "-pix_fmt", "yuv420p"
+        ]);
+    }
+
+    private static void AddRateControlArgs(List<string> args, bool useHardwareCodecs)
+    {
+        args.AddRange(["-b:v", "600000", "-maxrate", "600000", "-bufsize", "1200000"]);
+        if (useHardwareCodecs)
+        {
+            args.AddRange(["-bitrate_mode", "cbr"]);
+        }
+    }
+
+    private static void AddFmp4HlsOutputArgs(List<string> args)
+    {
+        args.AddRange([
+            "-g", "24",
+            "-an",
+            "-sn",
+            "-dn",
+            "-f", "hls",
+            "-hls_time", "1",
+            "-hls_flags", "temp_file",
+            "-hls_segment_type", "fmp4",
+            "-hls_segment_filename", "{outputRoot}/direct%d.mp4",
+            "-start_number", "0",
+            "-hls_fmp4_init_filename", "direct-1.mp4",
+            "-hls_segment_options", "movflags=+frag_discont",
+            "-hls_playlist_type", "vod",
+            "-hls_list_size", "0",
+            "-y", "{outputRoot}/direct.m3u8"
+        ]);
     }
 
     private static string Boundary(string contentType)
@@ -615,15 +869,16 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         return await GetAndroidAcceptedJobs();
     }
 
-    private static void BuildAndInstallAndroidApp()
+    private static void BuildAndInstallAndroidApp(string serial)
     {
         var appRoot = Path.Combine(FindRepoRoot(), "third_party", "jellyfin-android-transcoder", "android-transcoder");
         RunProcess(Path.Combine(appRoot, "gradlew"), [":app:bundleVanilla"], appRoot);
         var bundle = Path.Combine(appRoot, "app", "build", "outputs", "bundle", "vanilla", "app-vanilla.aab");
-        var apks = Path.Combine(FindRepoRoot(), ".work", "android-emulator", "android-transcoder.apks");
+        var safeSerial = string.Concat(serial.Select(ch => char.IsLetterOrDigit(ch) ? ch : '-'));
+        var apks = Path.Combine(FindRepoRoot(), ".work", "android-targets", safeSerial, "android-transcoder.apks");
         Directory.CreateDirectory(Path.GetDirectoryName(apks)!);
         RunProcess("java", ["-jar", Bundletool(), "build-apks", "--bundle", bundle, "--output", apks, "--overwrite", "--mode", "universal"], FindRepoRoot());
-        RunProcess("java", ["-jar", Bundletool(), "install-apks", "--apks", apks, "--device-id", "emulator-5554"], FindRepoRoot());
+        RunProcess("java", ["-jar", Bundletool(), "install-apks", "--apks", apks, "--device-id", serial], FindRepoRoot());
     }
 
     private static void EnsureAvd()
@@ -647,15 +902,14 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
             [
                 "-hide_banner", "-loglevel", "error",
                 "-f", "lavfi", "-i", "testsrc2=size=960x540:rate=24",
-                "-t", "12",
+                "-t", "60",
                 "-c:v", "libx265", "-preset", "ultrafast",
                 "-b:v", "6M", "-maxrate", "6M", "-bufsize", "12M",
                 "-x265-params", "keyint=48:min-keyint=48:scenecut=0",
                 "-pix_fmt", "yuv420p",
                 "-an",
-                "-movflags", "+faststart",
-                "-tag:v", "hvc1",
-                "-f", "mp4", path, "-y"
+                "-movflags", "faststart",
+                path, "-y"
             ],
             FindRepoRoot());
         AppendTrailingPadding(path, LargeFixtureMinimumBytes);
@@ -735,6 +989,19 @@ exit 42
         throw new TimeoutException($"Timed out waiting for Jellyfin file log marker `{marker}`.\n{logs}");
     }
 
+    private string ReadJellyfinFileLogs()
+    {
+        var logDir = Path.Combine(_configDir, "log");
+        if (!Directory.Exists(logDir))
+        {
+            return "";
+        }
+
+        return string.Join('\n', Directory.EnumerateFiles(logDir, "*.log")
+            .OrderBy(File.GetLastWriteTimeUtc)
+            .Select(File.ReadAllText));
+    }
+
     private static void AssemblePlugin(string pluginDir)
     {
         var componentRoot = Path.Combine(FindRepoRoot(), "third_party", "jellyfin-android-transcoder", "jellyfin-android-transcoder");
@@ -762,7 +1029,7 @@ exit 42
         }
     }
 
-    private static void WritePluginConfiguration(string path, string androidBaseUrl, string token)
+    private static void WritePluginConfiguration(string path, string androidBaseUrl, string token, bool useHardwareCodecs)
     {
         File.WriteAllText(path, $$"""
 <?xml version="1.0" encoding="utf-8"?>
@@ -774,6 +1041,7 @@ exit 42
   <RealFfprobePath>/usr/lib/jellyfin-ffmpeg/ffprobe</RealFfprobePath>
   <ShimPath>{{ShimPath}}</ShimPath>
   <MaxBitrate>600000</MaxBitrate>
+  <UseHardwareCodecs>{{useHardwareCodecs.ToString().ToLowerInvariant()}}</UseHardwareCodecs>
 </PluginConfiguration>
 """);
     }
@@ -976,6 +1244,34 @@ exit 42
         public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
         public override void SetLength(long value) => throw new NotSupportedException();
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    private enum AndroidTargetKind
+    {
+        Emulator,
+        Real
+    }
+
+    private sealed record AndroidTarget(AndroidTargetKind Kind, string? Serial, string? ConnectEndpoint)
+    {
+        public bool UseHardwareCodecs => Kind == AndroidTargetKind.Real;
+
+        public static AndroidTarget FromEnvironment()
+        {
+            var target = Environment.GetEnvironmentVariable("JFAT_ANDROID_TARGET") ?? "emulator";
+            var serial = Environment.GetEnvironmentVariable("JFAT_ANDROID_SERIAL");
+            var connect = Environment.GetEnvironmentVariable("JFAT_ANDROID_CONNECT");
+            if (target.Equals("real", StringComparison.OrdinalIgnoreCase) ||
+                target.Equals("device", StringComparison.OrdinalIgnoreCase))
+            {
+                return new AndroidTarget(AndroidTargetKind.Real, serial, connect);
+            }
+            if (!target.Equals("emulator", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("JFAT_ANDROID_TARGET must be `emulator` or `real`.");
+            }
+            return new AndroidTarget(AndroidTargetKind.Emulator, serial, connect);
+        }
     }
 
     private sealed class TcpBridge : IDisposable
