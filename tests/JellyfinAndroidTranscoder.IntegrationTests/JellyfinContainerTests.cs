@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Json;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using DotNet.Testcontainers.Builders;
@@ -20,6 +21,7 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
     private const string ContainerOutputDir = "/cache/transcodes/android-transcoder-test";
     private const string ContainerOutputPath = ContainerOutputDir + "/playlist.m3u8";
     private const string ContainerSegmentPath = ContainerOutputDir + "/segment0.ts";
+    private const string SourceSecret = "integration-source-secret";
 
     private readonly string _workDir;
     private readonly IContainer _jellyfin;
@@ -110,6 +112,7 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
     {
         await WaitForLogAsync("Core startup complete", TimeSpan.FromSeconds(60));
 
+        await PairAndroidWorkerAsync();
         await AssertContainerSuccess(["sh", "-c", ": > " + ContainerFallbackLogPath]);
         await AssertContainerSuccess(["mkdir", "-p", ContainerOutputDir]);
         var shimConfig = await AssertContainerSuccess(["cat", "/config/plugins/Jellyfin.Plugin.AndroidTranscoder/shim/shim-config.json"]);
@@ -128,16 +131,31 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
         Assert.Contains("#EXTM3U", playlist.Stdout);
         Assert.Contains("segment0.ts", playlist.Stdout);
         Assert.Equal(MockAndroidTranscoder.ExpectedOutputText, segment.Stdout);
-        Assert.Equal("", fallbackLog.Stdout);
-        Assert.Contains(_android.LastPath, new[] { "/api/v1/remoteprocesses/job-1/stdin", "/api/v1/remoteprocesses/job-1/files" });
+        Assert.Contains("pipe:0", fallbackLog.Stdout);
+        Assert.Equal("/api/v1/remoteprocesses/job-1/stdout", _android.LastPath);
         Assert.Equal("ffmpeg", _android.LastExecutable);
-        Assert.Contains("{outputRoot}/segment%d.ts", _android.LastRemoteArgs);
-        Assert.Contains("{outputRoot}/playlist.m3u8", _android.LastRemoteArgs);
-        Assert.True(_android.LastBodyLength > 0);
+        Assert.Contains("/AndroidTranscoder/Source/", _android.LastRemoteArgs);
+        Assert.Equal(0, _android.LastBodyLength);
     }
 
     [Fact]
     public async Task InstalledPluginCanPairAndroidWorkerThroughJellyfinEndpoint()
+    {
+        await WaitForLogAsync("Core startup complete", TimeSpan.FromSeconds(60));
+
+        using var pairDocument = await PairAndroidWorkerAsync();
+        Assert.True(pairDocument.RootElement.GetProperty("ok").GetBoolean());
+        Assert.Equal("http://host.docker.internal:" + _android.Port, pairDocument.RootElement.GetProperty("androidBaseUrl").GetString());
+        Assert.StartsWith("http://127.0.0.1:", pairDocument.RootElement.GetProperty("jellyfinBaseUrl").GetString());
+
+        var shimConfig = await AssertContainerSuccess(["cat", "/config/plugins/Jellyfin.Plugin.AndroidTranscoder/shim/shim-config.json"]);
+        Assert.Contains("host.docker.internal:" + _android.Port, shimConfig.Stdout);
+        Assert.Contains(_android.Token, shimConfig.Stdout);
+        Assert.Contains("127.0.0.1:", shimConfig.Stdout);
+    }
+
+    [Fact]
+    public async Task SourceEndpointServesOnlySignedAllowedMediaRootsWithRangeSupport()
     {
         await WaitForLogAsync("Core startup complete", TimeSpan.FromSeconds(60));
 
@@ -146,34 +164,17 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
             BaseAddress = new Uri($"http://127.0.0.1:{_jellyfin.GetMappedPublicPort(8096)}")
         };
 
-        using var pairingResponse = await client.PostAsync("/AndroidTranscoder/Pairing", null, CancellationToken.None);
-        pairingResponse.EnsureSuccessStatusCode();
-        using var pairingDocument = System.Text.Json.JsonDocument.Parse(await pairingResponse.Content.ReadAsStringAsync(CancellationToken.None));
-        var code = pairingDocument.RootElement.GetProperty("code").GetString();
-        Assert.False(string.IsNullOrWhiteSpace(code));
+        using HttpRequestMessage allowed = new(HttpMethod.Get, "/AndroidTranscoder/Source/" + SignSourceTicket(ContainerInputPath));
+        allowed.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 15);
+        using HttpResponseMessage allowedResponse = await client.SendAsync(allowed, CancellationToken.None);
+        var body = await allowedResponse.Content.ReadAsStringAsync(CancellationToken.None);
 
-        using var pairResponse = await client.PostAsJsonAsync(
-            "/AndroidTranscoder/Pair/" + code,
-            new
-            {
-                baseUrl = "http://host.docker.internal:" + _android.Port,
-                allBaseUrls = new[]
-                {
-                    "http://192.0.2.1:8098",
-                    "http://host.docker.internal:" + _android.Port
-                },
-                maxBitrate = 6000000
-            },
-            CancellationToken.None);
-        pairResponse.EnsureSuccessStatusCode();
+        Assert.Equal(HttpStatusCode.PartialContent, allowedResponse.StatusCode);
+        Assert.StartsWith("bytes 0-15/", allowedResponse.Content.Headers.ContentRange?.ToString());
+        Assert.Equal("container-input-", body);
 
-        using var pairDocument = System.Text.Json.JsonDocument.Parse(await pairResponse.Content.ReadAsStringAsync(CancellationToken.None));
-        Assert.True(pairDocument.RootElement.GetProperty("ok").GetBoolean());
-        Assert.Equal("http://host.docker.internal:" + _android.Port, pairDocument.RootElement.GetProperty("androidBaseUrl").GetString());
-
-        var shimConfig = await AssertContainerSuccess(["cat", "/config/plugins/Jellyfin.Plugin.AndroidTranscoder/shim/shim-config.json"]);
-        Assert.Contains("host.docker.internal:" + _android.Port, shimConfig.Stdout);
-        Assert.Contains(_android.Token, shimConfig.Stdout);
+        using HttpResponseMessage forbidden = await client.GetAsync("/AndroidTranscoder/Source/" + SignSourceTicket("/etc/passwd"), CancellationToken.None);
+        Assert.Equal(HttpStatusCode.Forbidden, forbidden.StatusCode);
     }
 
     private async Task<ExecResult> AssertContainerSuccess(IList<string> command)
@@ -299,7 +300,32 @@ VERSION
   exit 0
 fi
 printf '%s\n' "$*" >> "{{ContainerFallbackLogPath}}"
-exit 99
+if [[ "$*" != *"pipe:0"* ]]; then
+  exit 99
+fi
+args=("$@")
+out="${args[$((${#args[@]} - 1))]}"
+segment_pattern=""
+for ((i=0; i<${#args[@]}; i++)); do
+  if [[ "${args[$i]}" == "-hls_segment_filename" ]]; then
+    segment_pattern="${args[$((i+1))]}"
+  fi
+done
+cat >/dev/null
+mkdir -p "$(dirname "$out")"
+if [[ -z "$segment_pattern" ]]; then
+  segment_pattern="${out%.m3u8}%d.ts"
+fi
+segment="${segment_pattern/\%d/0}"
+mkdir -p "$(dirname "$segment")"
+printf '{{MockAndroidTranscoder.ExpectedOutputText}}' > "$segment"
+cat > "$out" <<EOF
+#EXTM3U
+#EXTINF:3.000,
+$(basename "$segment")
+#EXT-X-ENDLIST
+EOF
+exit 0
 """.ReplaceLineEndings("\n"));
         if (!OperatingSystem.IsWindows())
         {
@@ -322,9 +348,59 @@ exit 99
   <RealFfprobePath>{{ContainerProbePath}}</RealFfprobePath>
   <ShimPath>{{ShimPath}}</ShimPath>
   <MaxBitrate>6000000</MaxBitrate>
+  <SourceSecret>{{SourceSecret}}</SourceSecret>
+  <AllowedSourceRoots>
+    <string>/config/android-test</string>
+  </AllowedSourceRoots>
 </PluginConfiguration>
 """);
     }
+
+    private async Task<JsonDocument> PairAndroidWorkerAsync()
+    {
+        using HttpClient client = new()
+        {
+            BaseAddress = new Uri($"http://127.0.0.1:{_jellyfin.GetMappedPublicPort(8096)}")
+        };
+
+        using var pairingResponse = await client.PostAsync("/AndroidTranscoder/Pairing", null, CancellationToken.None);
+        pairingResponse.EnsureSuccessStatusCode();
+        using var pairingDocument = JsonDocument.Parse(await pairingResponse.Content.ReadAsStringAsync(CancellationToken.None));
+        var code = pairingDocument.RootElement.GetProperty("code").GetString();
+        Assert.False(string.IsNullOrWhiteSpace(code));
+
+        using var pairResponse = await client.PostAsJsonAsync(
+            "/AndroidTranscoder/Pair/" + code,
+            new
+            {
+                baseUrl = "http://host.docker.internal:" + _android.Port,
+                allBaseUrls = new[]
+                {
+                    "http://192.0.2.1:8098",
+                    "http://host.docker.internal:" + _android.Port
+                },
+                maxBitrate = 6000000
+            },
+            CancellationToken.None);
+        pairResponse.EnsureSuccessStatusCode();
+
+        return JsonDocument.Parse(await pairResponse.Content.ReadAsStringAsync(CancellationToken.None));
+    }
+
+    private static string SignSourceTicket(string path)
+    {
+        var payload = JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            ["path"] = path,
+            ["exp"] = DateTimeOffset.UtcNow.AddHours(12).ToUnixTimeSeconds()
+        });
+        var payloadBytes = Encoding.UTF8.GetBytes(payload);
+        var sig = HMACSHA256.HashData(Encoding.UTF8.GetBytes(SourceSecret), payloadBytes);
+        return Base64Url(payloadBytes) + "." + Base64Url(sig);
+    }
+
+    private static string Base64Url(byte[] bytes) =>
+        Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
 
     private static string FindRepoRoot()
     {
@@ -448,6 +524,7 @@ internal sealed class MockAndroidTranscoder : IAsyncDisposable
     public Dictionary<string, string> LastQuery { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     public long LastBodyLength { get; private set; }
+    public bool LastUsedSourceUrl { get; private set; }
 
     public static async Task<MockAndroidTranscoder> StartAsync()
     {
@@ -539,7 +616,8 @@ internal sealed class MockAndroidTranscoder : IAsyncDisposable
         if (path == "/api/v1/remoteprocesses" && context.Request.HttpMethod == "POST")
         {
             await CaptureRemoteProcessRequest(context.Request);
-            var body = Encoding.UTF8.GetBytes("""{"id":"job-1","stdinUrl":"/api/v1/remoteprocesses/job-1/stdin","filesUrl":"/api/v1/remoteprocesses/job-1/files"}""");
+            LastUsedSourceUrl = LastRemoteArgs.Contains("/AndroidTranscoder/Source/", StringComparison.Ordinal);
+            var body = Encoding.UTF8.GetBytes("""{"id":"job-1","stdinUrl":"/api/v1/remoteprocesses/job-1/stdin","filesUrl":"/api/v1/remoteprocesses/job-1/files","stdoutUrl":"/api/v1/remoteprocesses/job-1/stdout"}""");
             context.Response.ContentType = "application/json";
             context.Response.ContentLength64 = body.Length;
             await context.Response.OutputStream.WriteAsync(body);
@@ -552,6 +630,16 @@ internal sealed class MockAndroidTranscoder : IAsyncDisposable
             LastBodyLength = await DrainAsync(context.Request.InputStream);
             context.Response.ContentType = "application/json";
             await context.Response.OutputStream.WriteAsync("{}"u8.ToArray());
+            context.Response.Close();
+            return;
+        }
+
+        if (path == "/api/v1/remoteprocesses/job-1/stdout" && context.Request.HttpMethod == "GET")
+        {
+            context.Response.ContentType = "application/octet-stream";
+            context.Response.SendChunked = true;
+            await context.Response.OutputStream.WriteAsync(ExpectedOutput);
+            await context.Response.OutputStream.FlushAsync();
             context.Response.Close();
             return;
         }

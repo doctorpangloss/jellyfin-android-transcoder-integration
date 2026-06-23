@@ -904,7 +904,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
             [
                 "-hide_banner", "-loglevel", "error",
                 "-f", "lavfi", "-i", "testsrc2=size=960x540:rate=24",
-                "-t", "60",
+                "-t", "75",
                 "-c:v", "libx265", "-preset", "ultrafast",
                 "-b:v", "6M", "-maxrate", "6M", "-bufsize", "12M",
                 "-x265-params", "keyint=48:min-keyint=48:scenecut=0",
@@ -942,6 +942,13 @@ case " $* " in
     exec /usr/lib/jellyfin-ffmpeg/ffmpeg "$@"
     ;;
 esac
+args=" $* "
+case "$args" in *" -f mpegts "*) from_mpegts=1;; *) from_mpegts=0;; esac
+case "$args" in *" -i pipe:0 "*) from_pipe=1;; *) from_pipe=0;; esac
+case "$args" in *" -codec:v:0 copy "*) video_copy=1;; *) video_copy=0;; esac
+if [ "$from_mpegts" = 1 ] && [ "$from_pipe" = 1 ] && [ "$video_copy" = 1 ]; then
+  exec /usr/lib/jellyfin-ffmpeg/ffmpeg "$@"
+fi
 
 echo 'local ffmpeg fallback is forbidden in this test' >&2
 exit 42
