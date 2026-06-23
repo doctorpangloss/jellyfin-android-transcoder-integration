@@ -171,15 +171,15 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         var after = await WaitForAndroidAcceptedJobs(before);
         Assert.True(after > before, $"Expected Android acceptedJobs to increase, before={before}, after={after}");
 
-        var segment11 = await WaitForBrowserVisibleSegment(page, playlistUrl, 11, TimeSpan.FromSeconds(35));
+        var playedSeconds = await PlayHlsInBrowser(page, playlistUrl, TimeSpan.FromSeconds(120), targetSeconds: 69);
         Assert.True(
-            segment11.Bytes.Length > 0,
-            $"Expected Jellyfin browser playback to make segment 11 available. Segment URL: {segment11.Uri}. Android status: {await GetAndroidStatusText()}");
+            playedSeconds >= 69,
+            $"Expected browser HLS playback to advance through segment 22, got {playedSeconds:0.0}s. Android status: {await GetAndroidStatusText()}\nJellyfin transcode logs:\n{ReadJellyfinFileLogs()}");
 
-        var playedSeconds = await PlayHlsInBrowser(page, playlistUrl, TimeSpan.FromSeconds(35));
+        var segment22 = await WaitForBrowserVisibleSegment(page, playlistUrl, 22, TimeSpan.FromSeconds(15));
         Assert.True(
-            playedSeconds >= 15,
-            $"Expected browser HLS playback to advance beyond 15s, got {playedSeconds:0.0}s. Android status: {await GetAndroidStatusText()}\nJellyfin transcode logs:\n{ReadJellyfinFileLogs()}");
+            segment22.Bytes.Length > 0,
+            $"Expected Jellyfin browser playback to make segment 22 available. Segment URL: {segment22.Uri}. Android status: {await GetAndroidStatusText()}");
 
         var afterInputBytes = await GetAndroidInputBytes();
         Assert.True(
@@ -447,7 +447,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         }
     }
 
-    private static async Task<double> PlayHlsInBrowser(IPage page, Uri playlistUrl, TimeSpan timeout)
+    private static async Task<double> PlayHlsInBrowser(IPage page, Uri playlistUrl, TimeSpan timeout, int targetSeconds)
     {
         await page.SetContentAsync("""
 <!doctype html>
@@ -458,7 +458,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
 </html>
 """);
         return await page.EvaluateAsync<double>(
-            @"async ({ url, timeoutMs }) => {
+            @"async ({ url, timeoutMs, targetSeconds }) => {
                 await new Promise((resolve, reject) => {
                     const script = document.createElement('script');
                     script.src = 'https://cdn.jsdelivr.net/npm/hls.js@1.6.5/dist/hls.min.js';
@@ -489,7 +489,9 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
                         const hls = new window.Hls({
                             debug: false,
                             lowLatencyMode: false,
-                            maxBufferLength: 30,
+                            maxBufferLength: 9,
+                            maxMaxBufferLength: 9,
+                            backBufferLength: 0,
                             manifestLoadingTimeOut: 10000,
                             fragLoadingTimeOut: 10000
                         });
@@ -506,7 +508,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
                     }
                     const poll = setInterval(() => {
                         lastTime = video.currentTime || lastTime;
-                        if (lastTime >= 15) {
+                        if (lastTime >= targetSeconds) {
                             clearInterval(poll);
                             finish(lastTime);
                         }
@@ -517,7 +519,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
                     }, 250);
                 });
             }",
-            new { url = playlistUrl.ToString(), timeoutMs = (int)timeout.TotalMilliseconds });
+            new { url = playlistUrl.ToString(), timeoutMs = (int)timeout.TotalMilliseconds, targetSeconds });
     }
 
     private static async Task<(Process? Emulator, string AdbSerial)> StartAndroidAndApp(AndroidTarget target)

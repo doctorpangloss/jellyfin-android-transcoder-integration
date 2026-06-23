@@ -62,16 +62,15 @@ public sealed class LiveJellyfinPlaybackTests
 
         var playlist = await BrowserFetchText(page, playlistUrl);
         Assert.Contains("#EXTM3U", playlist);
+        var playedSeconds = await PlayHlsInBrowser(page, playlistUrl, TimeSpan.FromSeconds(120), targetSeconds: 69);
+        Assert.True(playedSeconds >= 69, $"Expected live browser playback to advance through segment 22, got {playedSeconds:0.0}s.");
+
         var mediaPlaylist = await ResolveMediaPlaylist(page, playlistUrl);
         var segments = SegmentUris(mediaPlaylist.Uri, mediaPlaylist.Playlist).ToArray();
-        Assert.True(segments.Length > 11, $"Expected Jellyfin media playlist to expose segment 11. Playlist:\n{mediaPlaylist.Playlist}");
-
-        var segment11 = await BrowserFetchBytes(page, segments[11]);
-        Assert.True(segment11.Length > 0, $"Segment 11 was empty: {segments[11]}");
-        Assert.Equal(0x47, segment11[0]);
-
-        var playedSeconds = await PlayHlsInBrowser(page, playlistUrl, TimeSpan.FromSeconds(35));
-        Assert.True(playedSeconds >= 15, $"Expected live browser playback to advance beyond 15s, got {playedSeconds:0.0}s.");
+        Assert.True(segments.Length > 22, $"Expected Jellyfin media playlist to expose segment 22 after playback. Playlist:\n{mediaPlaylist.Playlist}");
+        var segment22 = await BrowserFetchBytes(page, segments[22]);
+        Assert.True(segment22.Length > 0, $"Segment 22 was empty: {segments[22]}");
+        Assert.Equal(0x47, segment22[0]);
 
         await CleanupAndroidJobs();
     }
@@ -151,7 +150,7 @@ public sealed class LiveJellyfinPlaybackTests
         }
     }
 
-    private static async Task<double> PlayHlsInBrowser(IPage page, Uri playlistUrl, TimeSpan timeout)
+    private static async Task<double> PlayHlsInBrowser(IPage page, Uri playlistUrl, TimeSpan timeout, int targetSeconds)
     {
         await page.SetContentAsync("""
 <!doctype html>
@@ -162,7 +161,7 @@ public sealed class LiveJellyfinPlaybackTests
 </html>
 """);
         return await page.EvaluateAsync<double>(
-            @"async ({ url, timeoutMs }) => {
+            @"async ({ url, timeoutMs, targetSeconds }) => {
                 await new Promise((resolve, reject) => {
                     const script = document.createElement('script');
                     script.src = 'https://cdn.jsdelivr.net/npm/hls.js@1.6.5/dist/hls.min.js';
@@ -187,7 +186,9 @@ public sealed class LiveJellyfinPlaybackTests
                     const hls = new window.Hls({
                         debug: false,
                         lowLatencyMode: false,
-                        maxBufferLength: 30,
+                        maxBufferLength: 9,
+                        maxMaxBufferLength: 9,
+                        backBufferLength: 0,
                         manifestLoadingTimeOut: 10000,
                         fragLoadingTimeOut: 10000
                     });
@@ -199,7 +200,7 @@ public sealed class LiveJellyfinPlaybackTests
                     hls.attachMedia(video);
                     const poll = setInterval(() => {
                         lastTime = video.currentTime || lastTime;
-                        if (lastTime >= 15) {
+                        if (lastTime >= targetSeconds) {
                             clearInterval(poll);
                             finish(lastTime);
                         }
@@ -210,7 +211,7 @@ public sealed class LiveJellyfinPlaybackTests
                     }, 250);
                 });
             }",
-            new { url = playlistUrl.ToString(), timeoutMs = (int)timeout.TotalMilliseconds });
+            new { url = playlistUrl.ToString(), timeoutMs = (int)timeout.TotalMilliseconds, targetSeconds });
     }
 
     private static async Task CleanupAndroidJobs()
