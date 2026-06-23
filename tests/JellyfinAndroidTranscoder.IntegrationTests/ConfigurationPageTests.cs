@@ -1,11 +1,9 @@
-using Microsoft.Playwright;
-
 namespace JellyfinAndroidTranscoder.IntegrationTests;
 
 public sealed class ConfigurationPageTests
 {
     [Fact]
-    public async Task ConfigurationPageUsesPlainServerGeneratedQrImage()
+    public async Task StaticConfigurationPageRedirectsToServerRenderedPairingPage()
     {
         var repoRoot = FindRepoRoot();
         var pagePath = Path.Combine(
@@ -26,7 +24,8 @@ public sealed class ConfigurationPageTests
         Assert.DoesNotContain("pairUrl", html, StringComparison.Ordinal);
         Assert.DoesNotContain("${", html, StringComparison.Ordinal);
         Assert.DoesNotContain("`", html, StringComparison.Ordinal);
-        Assert.Contains("<img class=\"jfat-qr\" src=\"/AndroidTranscoder/PairingQr.svg\"", html, StringComparison.Ordinal);
+        Assert.Contains("url=/AndroidTranscoder/Page", html, StringComparison.Ordinal);
+        Assert.Contains("action=\"/AndroidTranscoder/Page\"", html, StringComparison.Ordinal);
     }
 
     private static string FindRepoRoot()
