@@ -131,10 +131,88 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
         Assert.Contains("#EXTM3U", playlist.Stdout);
         Assert.Contains("segment0.ts", playlist.Stdout);
         Assert.Equal(MockAndroidTranscoder.ExpectedOutputText, segment.Stdout);
-        Assert.Contains("pipe:0", fallbackLog.Stdout);
-        Assert.Equal("/api/v1/remoteprocesses/job-1/stdout", _android.LastPath);
+        Assert.DoesNotContain("local ffmpeg fallback is forbidden", fallbackLog.Stdout);
         Assert.Equal("ffmpeg", _android.LastExecutable);
         Assert.Contains("/AndroidTranscoder/Source/", _android.LastRemoteArgs);
+        var remoteArgs = JsonSerializer.Deserialize<string[]>(_android.LastRemoteArgs) ?? [];
+        AssertOption(remoteArgs, "-analyzeduration", "200M");
+        AssertOption(remoteArgs, "-probesize", "1G");
+        AssertOptionPair(remoteArgs, "-map", "0:0");
+        AssertOptionPair(remoteArgs, "-map", "0:1");
+        AssertOption(remoteArgs, "-map_metadata", "-1");
+        AssertOption(remoteArgs, "-map_chapters", "-1");
+        AssertOption(remoteArgs, "-threads", "0");
+        AssertOption(remoteArgs, "-profile:v:0", "high");
+        AssertOption(remoteArgs, "-level", "51");
+        AssertOption(remoteArgs, "-force_key_frames", "expr:gte(t,n_forced*3)");
+        Assert.DoesNotContain("-t", remoteArgs);
+        Assert.DoesNotContain("-sc_threshold", remoteArgs);
+        Assert.DoesNotContain("-copyts", remoteArgs);
+        Assert.DoesNotContain("-avoid_negative_ts", remoteArgs);
+        Assert.DoesNotContain("-start_at_zero", remoteArgs);
+        AssertOption(remoteArgs, "-max_muxing_queue_size", "2048");
+        AssertOption(remoteArgs, "-hls_time", "3");
+        AssertOption(remoteArgs, "-hls_segment_type", "fmp4");
+        AssertOption(remoteArgs, "-hls_segment_filename", "{outputRoot}/segment%d.ts");
+        Assert.DoesNotContain("0:a:0?", remoteArgs);
+        Assert.DoesNotContain("-preset", remoteArgs);
+        Assert.DoesNotContain("-crf", remoteArgs);
+        Assert.Equal(0, _android.LastBodyLength);
+    }
+
+    [Fact]
+    public async Task InstalledPluginHandlesJellyfinPassingWholeFfmpegCommandAsSingleArgument()
+    {
+        await WaitForLogAsync("Core startup complete", TimeSpan.FromSeconds(60));
+
+        await PairAndroidWorkerAsync();
+        await AssertContainerSuccess(["sh", "-c", ": > " + ContainerFallbackLogPath]);
+        await AssertContainerSuccess(["mkdir", "-p", ContainerOutputDir]);
+
+        var result = await _jellyfin.ExecAsync([ShimPath, JellyfinHlsSingleArgument()], CancellationToken.None);
+
+        Assert.True(result.ExitCode == 0, $"Shim failed with {result.ExitCode}\nSTDOUT:\n{result.Stdout}\nSTDERR:\n{result.Stderr}");
+        var fallbackLog = await AssertContainerSuccess(["cat", ContainerFallbackLogPath]);
+        Assert.DoesNotContain("local ffmpeg fallback is forbidden", fallbackLog.Stdout);
+        Assert.Equal("ffmpeg", _android.LastExecutable);
+        var remoteArgs = JsonSerializer.Deserialize<string[]>(_android.LastRemoteArgs) ?? [];
+        AssertOption(remoteArgs, "-analyzeduration", "200M");
+        AssertOption(remoteArgs, "-probesize", "1G");
+        AssertOptionPair(remoteArgs, "-map", "0:0");
+        AssertOptionPair(remoteArgs, "-map", "0:1");
+        AssertOption(remoteArgs, "-force_key_frames", "expr:gte(t,n_forced*3)");
+        Assert.DoesNotContain("-t", remoteArgs);
+        Assert.DoesNotContain("-sc_threshold", remoteArgs);
+        AssertOption(remoteArgs, "-hls_segment_filename", "{outputRoot}/segment%d.ts");
+        Assert.DoesNotContain("0:a:0?", remoteArgs);
+    }
+
+    [Fact]
+    public async Task InstalledPluginSeekedPlaybackUsesSignedSourceUrlWithoutDuplicatingInputSeek()
+    {
+        await WaitForLogAsync("Core startup complete", TimeSpan.FromSeconds(60));
+
+        await PairAndroidWorkerAsync();
+        await AssertContainerSuccess(["sh", "-c", ": > " + ContainerFallbackLogPath]);
+        await AssertContainerSuccess(["mkdir", "-p", ContainerOutputDir]);
+
+        var result = await _jellyfin.ExecAsync(JellyfinSeekedHlsArgs(), CancellationToken.None);
+
+        Assert.True(result.ExitCode == 0, $"Shim failed with {result.ExitCode}\nSTDOUT:\n{result.Stdout}\nSTDERR:\n{result.Stderr}");
+        var fallbackLog = await AssertContainerSuccess(["cat", ContainerFallbackLogPath]);
+        Assert.DoesNotContain("local ffmpeg fallback is forbidden", fallbackLog.Stdout);
+        Assert.Contains("/AndroidTranscoder/Source/", _android.LastRemoteArgs);
+        Assert.Contains("ss=00%3A01%3A30.000", _android.LastRemoteArgs);
+        var remoteArgs = JsonSerializer.Deserialize<string[]>(_android.LastRemoteArgs) ?? [];
+        AssertOption(remoteArgs, "-analyzeduration", "200M");
+        AssertOption(remoteArgs, "-probesize", "1G");
+        Assert.DoesNotContain("-ss", remoteArgs);
+        Assert.DoesNotContain("-noaccurate_seek", remoteArgs);
+        Assert.DoesNotContain("-t", remoteArgs);
+        AssertOption(remoteArgs, "-start_number", "30");
+        Assert.DoesNotContain("-copyts", remoteArgs);
+        Assert.DoesNotContain("-avoid_negative_ts", remoteArgs);
+        Assert.DoesNotContain("-start_at_zero", remoteArgs);
         Assert.Equal(0, _android.LastBodyLength);
     }
 
@@ -184,6 +262,30 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
         return result;
     }
 
+    private static void AssertOption(IReadOnlyList<string> args, string option, string? value)
+    {
+        var index = Array.IndexOf(args.ToArray(), option);
+        Assert.True(index >= 0, $"Expected remote args to contain {option}. Args: {JsonSerializer.Serialize(args)}");
+        if (value is not null)
+        {
+            Assert.True(index + 1 < args.Count, $"Expected {option} to have value {value}. Args: {JsonSerializer.Serialize(args)}");
+            Assert.Equal(value, args[index + 1]);
+        }
+    }
+
+    private static void AssertOptionPair(IReadOnlyList<string> args, string option, string value)
+    {
+        for (var i = 0; i + 1 < args.Count; i++)
+        {
+            if (args[i] == option && args[i + 1] == value)
+            {
+                return;
+            }
+        }
+
+        Assert.Fail($"Expected remote args to contain {option} {value}. Args: {JsonSerializer.Serialize(args)}");
+    }
+
     private static string[] JellyfinHlsArgs() =>
     [
         ShimPath,
@@ -201,6 +303,31 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
         "-hls_segment_filename", ContainerOutputDir + "/segment%d.ts",
         "-y", ContainerOutputPath
     ];
+
+    private static string[] JellyfinSeekedHlsArgs() =>
+    [
+        ShimPath,
+        "-analyzeduration", "200M", "-probesize", "1G", "-ss", "00:01:30.000", "-noaccurate_seek", "-i", "file:" + ContainerInputPath,
+        "-map_metadata", "-1", "-map_chapters", "-1", "-threads", "0",
+        "-map", "0:0", "-map", "0:1", "-map", "-0:s",
+        "-codec:v:0", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-maxrate", "8000000", "-bufsize", "12000000", "-profile:v:0", "high",
+        "-level", "51", "-force_key_frames:0", "expr:gte(t,n_forced*3)",
+        "-sc_threshold:v:0", "0", "-vf",
+        @"setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc,scale=trunc(min(max(iw\,ih*a)\,1920)/2)*2:trunc(ow/a/2)*2,tonemapx=t=bt709",
+        "-codec:a:0", "libfdk_aac", "-ac", "2", "-ab", "256000", "-af", "volume=2",
+        "-copyts", "-avoid_negative_ts", "disabled", "-start_at_zero", "-max_muxing_queue_size", "2048",
+        "-f", "hls", "-hls_time", "3", "-hls_segment_type", "fmp4",
+        "-start_number", "30", "-hls_segment_filename", ContainerOutputDir + "/segment%d.ts",
+        "-hls_playlist_type", "vod", "-hls_list_size", "0",
+        "-y", ContainerOutputPath
+    ];
+
+    private static string JellyfinHlsSingleArgument() =>
+        string.Join(' ', JellyfinHlsArgs().Skip(1).Select(QuoteArgument));
+
+    private static string QuoteArgument(string arg) =>
+        arg.Any(char.IsWhiteSpace) || arg.Contains('"', StringComparison.Ordinal) ? "\"" + arg.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"" : arg;
 
     private async Task<string> WaitForLogAsync(string marker, TimeSpan timeout)
     {

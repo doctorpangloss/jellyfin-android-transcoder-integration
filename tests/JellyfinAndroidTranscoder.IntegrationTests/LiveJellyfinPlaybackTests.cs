@@ -62,6 +62,13 @@ public sealed class LiveJellyfinPlaybackTests
 
         var playlist = await BrowserFetchText(page, playlistUrl);
         Assert.Contains("#EXTM3U", playlist);
+
+        var beforeSeekJobs = await GetAndroidAcceptedJobs();
+        var seekedSeconds = await PlayHlsSeekInBrowser(page, playlistUrl, TimeSpan.FromSeconds(90), seekToSeconds: 30, targetSeconds: 34);
+        Assert.True(seekedSeconds >= 34, $"Expected live browser playback to continue after seek, got {seekedSeconds:0.0}s.");
+        var afterSeekJobs = await GetAndroidAcceptedJobs();
+        Assert.True(afterSeekJobs > beforeSeekJobs, $"Expected browser seek to create an Android transcode job, before={beforeSeekJobs}, after={afterSeekJobs}.");
+
         var playedSeconds = await PlayHlsInBrowser(page, playlistUrl, TimeSpan.FromSeconds(120), targetSeconds: 69);
         Assert.True(playedSeconds >= 69, $"Expected live browser playback to advance through segment 22, got {playedSeconds:0.0}s.");
 
@@ -212,6 +219,92 @@ public sealed class LiveJellyfinPlaybackTests
                 });
             }",
             new { url = playlistUrl.ToString(), timeoutMs = (int)timeout.TotalMilliseconds, targetSeconds });
+    }
+
+    private static async Task<double> PlayHlsSeekInBrowser(IPage page, Uri playlistUrl, TimeSpan timeout, int seekToSeconds, int targetSeconds)
+    {
+        await page.SetContentAsync("""
+<!doctype html>
+<html>
+<body>
+<video id="video" muted playsinline autoplay controls></video>
+</body>
+</html>
+""");
+        return await page.EvaluateAsync<double>(
+            @"async ({ url, timeoutMs, seekToSeconds, targetSeconds }) => {
+                await new Promise((resolve, reject) => {
+                    const script = document.createElement('script');
+                    script.src = 'https://cdn.jsdelivr.net/npm/hls.js@1.6.5/dist/hls.min.js';
+                    script.onload = resolve;
+                    script.onerror = () => reject(new Error('failed to load hls.js'));
+                    document.head.appendChild(script);
+                });
+
+                const video = document.getElementById('video');
+                const started = performance.now();
+                let lastTime = 0;
+                return await new Promise((resolve, reject) => {
+                    const timeout = setTimeout(() => resolve(lastTime), timeoutMs);
+                    const finish = value => {
+                        clearTimeout(timeout);
+                        resolve(value);
+                    };
+                    const fail = error => {
+                        clearTimeout(timeout);
+                        reject(error);
+                    };
+                    const hls = new window.Hls({
+                        debug: false,
+                        lowLatencyMode: false,
+                        maxBufferLength: 9,
+                        maxMaxBufferLength: 9,
+                        backBufferLength: 0,
+                        manifestLoadingTimeOut: 10000,
+                        fragLoadingTimeOut: 15000
+                    });
+                    let didSeek = false;
+                    hls.on(window.Hls.Events.ERROR, (_event, data) => {
+                        if (data && data.fatal) fail(new Error(`${data.type || 'hls'} ${data.details || 'fatal'}`));
+                    });
+                    hls.on(window.Hls.Events.MANIFEST_PARSED, () => video.play().catch(fail));
+                    hls.loadSource(url);
+                    hls.attachMedia(video);
+                    const poll = setInterval(() => {
+                        lastTime = video.currentTime || lastTime;
+                        if (!didSeek && lastTime >= 3) {
+                            didSeek = true;
+                            video.currentTime = seekToSeconds;
+                        }
+                        if (didSeek && lastTime >= targetSeconds) {
+                            clearInterval(poll);
+                            finish(lastTime);
+                        }
+                        if (performance.now() - started > timeoutMs) {
+                            clearInterval(poll);
+                            finish(lastTime);
+                        }
+                    }, 250);
+                });
+            }",
+            new { url = playlistUrl.ToString(), timeoutMs = (int)timeout.TotalMilliseconds, seekToSeconds, targetSeconds });
+    }
+
+    private static async Task<int> GetAndroidAcceptedJobs()
+    {
+        var statusUrl = Environment.GetEnvironmentVariable("JFAT_ANDROID_STATUS_URL");
+        if (string.IsNullOrWhiteSpace(statusUrl))
+        {
+            return 0;
+        }
+
+        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+        var token = Environment.GetEnvironmentVariable("JFAT_ANDROID_TOKEN") ?? "1234";
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        using var response = await client.GetAsync(statusUrl);
+        response.EnsureSuccessStatusCode();
+        using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        return document.RootElement.GetProperty("acceptedJobs").GetInt32();
     }
 
     private static async Task CleanupAndroidJobs()

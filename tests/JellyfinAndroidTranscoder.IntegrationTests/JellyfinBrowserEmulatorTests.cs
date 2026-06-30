@@ -21,6 +21,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
     private const long LargeFixtureMinimumBytes = 1L * 1024L * 1024L * 1024L;
     private const long StartupReadCeilingBytes = 128L * 1024L * 1024L;
     private const string ShimPath = "/config/plugins/Jellyfin.Plugin.AndroidTranscoder/shim/jfat-ffmpeg";
+    private const string SourceSecret = "browser-emulator-source-secret";
 
     private readonly string _repoRoot = FindRepoRoot();
     private readonly string _workDir;
@@ -84,6 +85,8 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         (_emulator, _adbSerial) = await StartAndroidAndApp(_androidTarget);
         _androidBridge = TcpBridge.Start(AndroidBridgePort, IPAddress.Loopback, AndroidForwardPort);
         await _jellyfin.StartAsync();
+        await WaitForLogAsync("Core startup complete", TimeSpan.FromSeconds(90));
+        await ConfigureShimSourceUrlForAndroid();
     }
 
     public async Task DisposeAsync()
@@ -171,6 +174,18 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         var after = await WaitForAndroidAcceptedJobs(before);
         Assert.True(after > before, $"Expected Android acceptedJobs to increase, before={before}, after={after}");
 
+        var seekedSeconds = await PlayHlsSeekInBrowser(page, playlistUrl, TimeSpan.FromSeconds(90), seekToSeconds: 30, targetSeconds: 34);
+        Assert.True(
+            seekedSeconds >= 34,
+            $"Expected browser HLS playback to continue after seeking, got {seekedSeconds:0.0}s. Android status: {await GetAndroidStatusText()}\nJellyfin transcode logs:\n{ReadJellyfinFileLogs()}");
+        var remoteArgLines = ReadJellyfinFileLogs().Split('\n')
+            .Where(line => line.Contains("jfat: remote ffmpeg args", StringComparison.Ordinal))
+            .ToArray();
+        Assert.Contains(remoteArgLines, line =>
+            line.Contains("http://", StringComparison.Ordinal) &&
+            line.Contains("/AndroidTranscoder/Source/", StringComparison.Ordinal));
+        Assert.DoesNotContain(remoteArgLines, line => line.Contains("https://", StringComparison.Ordinal));
+
         var playedSeconds = await PlayHlsInBrowser(page, playlistUrl, TimeSpan.FromSeconds(120), targetSeconds: 69);
         Assert.True(
             playedSeconds >= 69,
@@ -239,6 +254,51 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         Assert.True(
             afterInputBytes - beforeInputBytes < LargeFixtureMinimumBytes,
             $"The test must observe output before the full large upload completes; uploaded={afterInputBytes - beforeInputBytes}, fixture={LargeFixtureMinimumBytes}.");
+    }
+
+    [Fact]
+    public async Task AndroidMediacodecMpegtsOutputProducesNoFramesAndShimMustAvoidIt()
+    {
+        var beforeInputBytes = await GetAndroidInputBytes();
+        var beforeAccepted = await GetAndroidAcceptedJobs();
+        var remoteArgs = EncodeRemoteArgs(BuildDirectRemoteFfmpegArgs(_androidTarget.UseHardwareCodecs, segmentType: "mpegts"));
+
+        await using var input = File.OpenRead(_mediaPath);
+        var startup = Stopwatch.StartNew();
+        RawRemoteProcessExchange exchange;
+        try
+        {
+            exchange = await RawRemoteProcessExchange.Start(
+                AndroidForwardPort,
+                AndroidToken,
+                remoteArgs,
+                new RateLimitedStream(input, 8L * 1024L * 1024L),
+                TimeSpan.FromSeconds(10));
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException("Android closed the MPEG-TS remote process request before response headers. Status: " + await GetAndroidStatusText(), ex);
+        }
+
+        await using (exchange)
+        {
+            await Assert.ThrowsAsync<TimeoutException>(() => ReadUntilRemoteFile(
+                exchange.ResponseBody,
+                exchange.Boundary,
+                (path, bytes) => path.EndsWith(".ts", StringComparison.OrdinalIgnoreCase) && bytes.Length > 0,
+                TimeSpan.FromSeconds(10)));
+            startup.Stop();
+        }
+
+        var afterAccepted = await GetAndroidAcceptedJobs();
+        Assert.True(afterAccepted > beforeAccepted, $"Expected Android to accept a remote process, before={beforeAccepted}, after={afterAccepted}");
+        var status = await GetAndroidStatusText();
+        Assert.Contains("Output file is empty", status);
+        Assert.Contains("\"-hls_segment_type\",\"mpegts\"", Encoding.UTF8.GetString(Base64UrlDecode(remoteArgs)));
+        var afterInputBytes = await GetAndroidInputBytes();
+        Assert.True(
+            afterInputBytes - beforeInputBytes < LargeFixtureMinimumBytes,
+            $"The test must observe MPEG-TS output before the full large upload completes; uploaded={afterInputBytes - beforeInputBytes}, fixture={LargeFixtureMinimumBytes}.");
     }
 
     private async Task<AuthResult> ConfigureJellyfin(HttpClient client)
@@ -522,6 +582,81 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
             new { url = playlistUrl.ToString(), timeoutMs = (int)timeout.TotalMilliseconds, targetSeconds });
     }
 
+    private static async Task<double> PlayHlsSeekInBrowser(IPage page, Uri playlistUrl, TimeSpan timeout, int seekToSeconds, int targetSeconds)
+    {
+        await page.SetContentAsync("""
+<!doctype html>
+<html>
+<body>
+<video id="video" muted playsinline autoplay controls></video>
+</body>
+</html>
+""");
+        return await page.EvaluateAsync<double>(
+            @"async ({ url, timeoutMs, seekToSeconds, targetSeconds }) => {
+                await new Promise((resolve, reject) => {
+                    if (window.Hls) {
+                        resolve();
+                        return;
+                    }
+                    const script = document.createElement('script');
+                    script.src = 'https://cdn.jsdelivr.net/npm/hls.js@1.6.5/dist/hls.min.js';
+                    script.onload = resolve;
+                    script.onerror = () => reject(new Error('failed to load hls.js'));
+                    document.head.appendChild(script);
+                });
+
+                const video = document.getElementById('video');
+                const started = performance.now();
+                let lastTime = 0;
+                return await new Promise((resolve, reject) => {
+                    const timeout = setTimeout(() => resolve(lastTime), timeoutMs);
+                    const finish = value => {
+                        clearTimeout(timeout);
+                        resolve(value);
+                    };
+                    const fail = error => {
+                        clearTimeout(timeout);
+                        reject(error);
+                    };
+                    const hls = new window.Hls({
+                        debug: false,
+                        lowLatencyMode: false,
+                        maxBufferLength: 9,
+                        maxMaxBufferLength: 9,
+                        backBufferLength: 0,
+                        manifestLoadingTimeOut: 10000,
+                        fragLoadingTimeOut: 15000
+                    });
+                    let didSeek = false;
+                    hls.on(window.Hls.Events.ERROR, (_event, data) => {
+                        if (data && data.fatal) {
+                            fail(new Error(`${data.type || 'hls'} ${data.details || 'fatal'}`));
+                        }
+                    });
+                    hls.on(window.Hls.Events.MANIFEST_PARSED, () => video.play().catch(fail));
+                    hls.loadSource(url);
+                    hls.attachMedia(video);
+                    const poll = setInterval(() => {
+                        lastTime = video.currentTime || lastTime;
+                        if (!didSeek && lastTime >= 3) {
+                            didSeek = true;
+                            video.currentTime = seekToSeconds;
+                        }
+                        if (didSeek && lastTime >= targetSeconds) {
+                            clearInterval(poll);
+                            finish(lastTime);
+                        }
+                        if (performance.now() - started > timeoutMs) {
+                            clearInterval(poll);
+                            finish(lastTime);
+                        }
+                    }, 250);
+                });
+            }",
+            new { url = playlistUrl.ToString(), timeoutMs = (int)timeout.TotalMilliseconds, seekToSeconds, targetSeconds });
+    }
+
     private static async Task<(Process? Emulator, string AdbSerial)> StartAndroidAndApp(AndroidTarget target)
     {
         Process? emulator = null;
@@ -653,14 +788,28 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
             .Replace('/', '_');
     }
 
-    private static IReadOnlyList<string> BuildDirectRemoteFfmpegArgs(bool useHardwareCodecs)
+    private static byte[] Base64UrlDecode(string text)
+    {
+        var padded = text.Replace('-', '+').Replace('_', '/');
+        padded = padded.PadRight(padded.Length + ((4 - padded.Length % 4) % 4), '=');
+        return Convert.FromBase64String(padded);
+    }
+
+    private static IReadOnlyList<string> BuildDirectRemoteFfmpegArgs(bool useHardwareCodecs, string segmentType = "fmp4")
     {
         var args = new List<string>();
         AddRemoteFfmpegPreamble(args, useHardwareCodecs);
         args.AddRange(["-i", "{input}", "-t", "12", "-map", "0:v:0"]);
         AddVideoEncodeArgs(args, useHardwareCodecs);
         AddRateControlArgs(args, useHardwareCodecs);
-        AddFmp4HlsOutputArgs(args);
+        if (string.Equals(segmentType, "mpegts", StringComparison.OrdinalIgnoreCase))
+        {
+            AddMpegtsHlsOutputArgs(args);
+        }
+        else
+        {
+            AddFmp4HlsOutputArgs(args);
+        }
         return args;
     }
 
@@ -724,6 +873,23 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
             "-hls_fmp4_init_filename", "direct-1.mp4",
             "-hls_segment_options", "movflags=+frag_discont",
             "-hls_playlist_type", "vod",
+            "-hls_list_size", "0",
+            "-y", "{outputRoot}/direct.m3u8"
+        ]);
+    }
+
+    private static void AddMpegtsHlsOutputArgs(List<string> args)
+    {
+        args.AddRange([
+            "-g", "24",
+            "-an",
+            "-sn",
+            "-dn",
+            "-f", "hls",
+            "-hls_time", "1",
+            "-hls_segment_type", "mpegts",
+            "-hls_segment_filename", "{outputRoot}/direct%d.ts",
+            "-start_number", "0",
             "-hls_list_size", "0",
             "-y", "{outputRoot}/direct.m3u8"
         ]);
@@ -1051,8 +1217,69 @@ exit 42
   <ShimPath>{{ShimPath}}</ShimPath>
   <MaxBitrate>600000</MaxBitrate>
   <UseHardwareCodecs>{{useHardwareCodecs.ToString().ToLowerInvariant()}}</UseHardwareCodecs>
+  <SourceSecret>{{SourceSecret}}</SourceSecret>
+  <AllowedSourceRoots>
+    <string>/media</string>
+  </AllowedSourceRoots>
 </PluginConfiguration>
 """);
+    }
+
+    private async Task ConfigureShimSourceUrlForAndroid()
+    {
+        var shimConfigPath = Path.Combine(_configDir, "plugins", "Jellyfin.Plugin.AndroidTranscoder", "shim", "shim-config.json");
+        const string containerShimConfigPath = "/config/plugins/Jellyfin.Plugin.AndroidTranscoder/shim/shim-config.json";
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        while (!File.Exists(shimConfigPath) && DateTime.UtcNow < deadline)
+        {
+            Thread.Sleep(250);
+        }
+
+        if (!File.Exists(shimConfigPath))
+        {
+            throw new FileNotFoundException("Timed out waiting for plugin shim config.", shimConfigPath);
+        }
+
+        var chmod = await _jellyfin.ExecAsync(["chmod", "666", containerShimConfigPath], CancellationToken.None);
+        if (chmod.ExitCode != 0)
+        {
+            throw new InvalidOperationException($"Could not make shim config writable.\nSTDOUT:\n{chmod.Stdout}\nSTDERR:\n{chmod.Stderr}");
+        }
+
+        using var document = JsonDocument.Parse(File.ReadAllText(shimConfigPath));
+        var values = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var property in document.RootElement.EnumerateObject())
+        {
+            values[property.Name] = property.Value.ValueKind switch
+            {
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                JsonValueKind.Number when property.Value.TryGetInt32(out var intValue) => intValue,
+                JsonValueKind.String => property.Value.GetString(),
+                _ => property.Value.GetRawText()
+            };
+        }
+
+        values["JellyfinBaseUrl"] = AndroidReachableJellyfinBaseUrl();
+        values["SourceSecret"] = SourceSecret;
+        File.WriteAllText(shimConfigPath, JsonSerializer.Serialize(values));
+    }
+
+    private string AndroidReachableJellyfinBaseUrl()
+    {
+        var overrideUrl = Environment.GetEnvironmentVariable("JFAT_JELLYFIN_BASE_URL_FOR_ANDROID");
+        if (!string.IsNullOrWhiteSpace(overrideUrl))
+        {
+            return overrideUrl.TrimEnd('/');
+        }
+
+        var port = _jellyfin.GetMappedPublicPort(8096);
+        if (_androidTarget.Kind == AndroidTargetKind.Emulator)
+        {
+            return $"http://10.0.2.2:{port}";
+        }
+
+        throw new InvalidOperationException("Set JFAT_JELLYFIN_BASE_URL_FOR_ANDROID to a Jellyfin URL reachable by the real Android device.");
     }
 
     private static Process StartProcess(string fileName, IReadOnlyList<string> args)
