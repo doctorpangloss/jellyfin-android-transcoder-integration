@@ -495,6 +495,30 @@ exit 0
         using var pairingDocument = JsonDocument.Parse(await pairingResponse.Content.ReadAsStringAsync(CancellationToken.None));
         var code = pairingDocument.RootElement.GetProperty("code").GetString();
         Assert.False(string.IsNullOrWhiteSpace(code));
+        Assert.Equal("/AndroidTranscoder/Pair/" + code, pairingDocument.RootElement.GetProperty("path").GetString());
+
+        using var pageResponse = await client.GetAsync("/AndroidTranscoder/Page", CancellationToken.None);
+        pageResponse.EnsureSuccessStatusCode();
+        var page = await pageResponse.Content.ReadAsStringAsync(CancellationToken.None);
+        Assert.Contains("/AndroidTranscoder/Pair/", page);
+        Assert.Contains("/AndroidTranscoder/PairingQr.svg?code=", page);
+
+        using var invalidPairResponse = await client.PostAsJsonAsync(
+            "/AndroidTranscoder/Pair/000000",
+            new
+            {
+                baseUrl = "http://host.docker.internal:" + _android.Port,
+                allBaseUrls = new[]
+                {
+                    "http://host.docker.internal:" + _android.Port
+                },
+                token = _android.Token,
+                maxBitrate = 6000000
+            },
+            CancellationToken.None);
+        Assert.Equal(HttpStatusCode.Unauthorized, invalidPairResponse.StatusCode);
+        var invalidPairBody = await invalidPairResponse.Content.ReadAsStringAsync(CancellationToken.None);
+        Assert.Contains("pairing_code_invalid_or_expired", invalidPairBody);
 
         using var pairResponse = await client.PostAsJsonAsync(
             "/AndroidTranscoder/Pair/" + code,
@@ -506,6 +530,7 @@ exit 0
                     "http://192.0.2.1:8098",
                     "http://host.docker.internal:" + _android.Port
                 },
+                token = _android.Token,
                 maxBitrate = 6000000
             },
             CancellationToken.None);
