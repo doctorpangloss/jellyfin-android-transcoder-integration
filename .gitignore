@@ -8,3 +8,5 @@ artifacts/
 work/
 .work/
 TestResults/
+third_party/jellyfin-ffmpeg-src/
+third_party/jellyfin-server/
