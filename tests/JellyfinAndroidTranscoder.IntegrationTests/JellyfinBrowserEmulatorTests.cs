@@ -174,10 +174,13 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
         var after = await WaitForAndroidAcceptedJobs(before);
         Assert.True(after > before, $"Expected Android acceptedJobs to increase, before={before}, after={after}");
 
-        var seekedSeconds = await PlayHlsSeekInBrowser(page, playlistUrl, TimeSpan.FromSeconds(90), seekToSeconds: 30, targetSeconds: 34);
+        var seekResult = await PlayHlsSeekInBrowser(page, playlistUrl, TimeSpan.FromSeconds(30), seekToSeconds: 30, targetSeconds: 34);
         Assert.True(
-            seekedSeconds >= 34,
-            $"Expected browser HLS playback to continue after seeking, got {seekedSeconds:0.0}s. Android status: {await GetAndroidStatusText()}\nJellyfin transcode logs:\n{ReadJellyfinFileLogs()}");
+            seekResult.CurrentTime >= 34,
+            $"Expected browser HLS playback to continue after seeking, got {seekResult.CurrentTime:0.0}s. Android status: {await GetAndroidStatusText()}\nJellyfin transcode logs:\n{ReadJellyfinFileLogs()}");
+        Assert.True(
+            seekResult.SeekResumeMilliseconds < 10_000,
+            $"Expected browser playback to resume within 10s after seek, took {seekResult.SeekResumeMilliseconds / 1000:0.0}s. Android status: {await GetAndroidStatusText()}\nJellyfin transcode logs:\n{ReadJellyfinFileLogs()}");
         var remoteArgLines = ReadJellyfinFileLogs().Split('\n')
             .Where(line => line.Contains("jfat: remote ffmpeg args", StringComparison.Ordinal))
             .ToArray();
@@ -582,7 +585,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
             new { url = playlistUrl.ToString(), timeoutMs = (int)timeout.TotalMilliseconds, targetSeconds });
     }
 
-    private static async Task<double> PlayHlsSeekInBrowser(IPage page, Uri playlistUrl, TimeSpan timeout, int seekToSeconds, int targetSeconds)
+    private static async Task<SeekPlaybackResult> PlayHlsSeekInBrowser(IPage page, Uri playlistUrl, TimeSpan timeout, int seekToSeconds, int targetSeconds)
     {
         await page.SetContentAsync("""
 <!doctype html>
@@ -592,7 +595,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
 </body>
 </html>
 """);
-        return await page.EvaluateAsync<double>(
+        return await page.EvaluateAsync<SeekPlaybackResult>(
             @"async ({ url, timeoutMs, seekToSeconds, targetSeconds }) => {
                 await new Promise((resolve, reject) => {
                     if (window.Hls) {
@@ -609,11 +612,17 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
                 const video = document.getElementById('video');
                 const started = performance.now();
                 let lastTime = 0;
+                let seekStartedAt = 0;
                 return await new Promise((resolve, reject) => {
-                    const timeout = setTimeout(() => resolve(lastTime), timeoutMs);
+                    const result = () => ({
+                        currentTime: lastTime,
+                        seekResumeMilliseconds: seekStartedAt ? performance.now() - seekStartedAt : timeoutMs
+                    });
+                    const timeout = setTimeout(() => resolve(result()), timeoutMs);
                     const finish = value => {
                         clearTimeout(timeout);
-                        resolve(value);
+                        lastTime = value;
+                        resolve(result());
                     };
                     const fail = error => {
                         clearTimeout(timeout);
@@ -641,6 +650,7 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
                         lastTime = video.currentTime || lastTime;
                         if (!didSeek && lastTime >= 3) {
                             didSeek = true;
+                            seekStartedAt = performance.now();
                             video.currentTime = seekToSeconds;
                         }
                         if (didSeek && lastTime >= targetSeconds) {
@@ -655,6 +665,12 @@ public sealed class JellyfinBrowserEmulatorTests : IAsyncLifetime
                 });
             }",
             new { url = playlistUrl.ToString(), timeoutMs = (int)timeout.TotalMilliseconds, seekToSeconds, targetSeconds });
+    }
+
+    private sealed class SeekPlaybackResult
+    {
+        public double CurrentTime { get; set; }
+        public double SeekResumeMilliseconds { get; set; }
     }
 
     private static async Task<(Process? Emulator, string AdbSerial)> StartAndroidAndApp(AndroidTarget target)
