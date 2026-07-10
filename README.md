@@ -74,15 +74,15 @@ When `JFAT_ANDROID_TARGET=real`, the test installs the same app bundle on the se
 
 This repo is not installed on production systems. It exists to prove that the release artifacts in `doctorpangloss/jellyfin-android-transcoder` work together with Jellyfin and Android as deployed components.
 
-For actual deployment, use the `v1.0.0` release assets from:
+For actual deployment, use the verified `v1.1.13` release assets from:
 
 ```text
-https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/tag/v1.0.0
+https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/tag/v1.1.13
 ```
 
 Install:
 
-- `jellyfin-android-transcoder-1.0.0.apk` or `jellyfin-android-transcoder-1.0.0.aab` on the Android phone.
-- `Jellyfin.Plugin.AndroidTranscoder-1.0.0.zip` on the Jellyfin server.
+- `jellyfin-android-transcoder-1.1.13.apk` or `jellyfin-android-transcoder-1.1.13.aab` on the Android phone.
+- `Jellyfin.Plugin.AndroidTranscoder-1.1.13.zip` on the Jellyfin server.
 
 The component repository README contains the Docker Compose and ADB/sideload deployment instructions.
