@@ -153,6 +153,8 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
         Assert.DoesNotContain("-avoid_negative_ts", remoteArgs);
         Assert.DoesNotContain("-start_at_zero", remoteArgs);
         Assert.DoesNotContain("-max_muxing_queue_size", remoteArgs);
+        AssertOption(remoteArgs, "-muxpreload", "0");
+        AssertOption(remoteArgs, "-muxdelay", "0");
         AssertOption(remoteArgs, "-f", "mpegts");
         Assert.Equal("pipe:1", remoteArgs[^1]);
         Assert.DoesNotContain("-hls_time", remoteArgs);
