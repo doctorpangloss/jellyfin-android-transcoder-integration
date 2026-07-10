@@ -222,8 +222,8 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
         Assert.DoesNotContain("-noaccurate_seek", remoteArgs);
         Assert.DoesNotContain("-t", remoteArgs);
         Assert.DoesNotContain("-start_number", remoteArgs);
-        Assert.DoesNotContain("-copyts", remoteArgs);
-        Assert.DoesNotContain("-avoid_negative_ts", remoteArgs);
+        Assert.Contains("-copyts", remoteArgs);
+        AssertOption(remoteArgs, "-avoid_negative_ts", "disabled");
         Assert.DoesNotContain("-start_at_zero", remoteArgs);
         Assert.Equal(0, _android.LastBodyLength);
         Assert.Contains("-start_number 30", fallbackLog.Stdout);
