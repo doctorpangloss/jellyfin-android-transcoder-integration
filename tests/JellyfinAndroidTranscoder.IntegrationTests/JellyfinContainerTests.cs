@@ -17,6 +17,7 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
     private const string ContainerFfmpegPath = "/config/android-test/fake-ffmpeg.sh";
     private const string ContainerProbePath = "/config/android-test/ffprobe-hevc.sh";
     private const string ContainerFallbackLogPath = "/config/android-test/fallback-ffmpeg.log";
+    private const string ContainerSourceLogPath = "/config/android-test/source-ffmpeg.log";
     private const string ContainerInputPath = "/config/android-test/movie.mkv";
     private const string ContainerOutputDir = "/cache/transcodes/android-transcoder-test";
     private const string ContainerOutputPath = ContainerOutputDir + "/playlist.m3u8";
@@ -49,6 +50,7 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
         WriteProbeScript(Path.Combine(androidTestDir, "ffprobe-hevc.sh"));
         WriteFakeFfmpegScript(Path.Combine(androidTestDir, "fake-ffmpeg.sh"));
         File.WriteAllText(Path.Combine(androidTestDir, "fallback-ffmpeg.log"), "");
+        File.WriteAllText(Path.Combine(androidTestDir, "source-ffmpeg.log"), "");
         File.WriteAllText(Path.Combine(androidTestDir, "movie.mkv"), string.Concat(Enumerable.Repeat("container-input-", 4096)));
         WritePluginConfiguration(
             Path.Combine(pluginConfigurationsDir, "Jellyfin.Plugin.AndroidTranscoder.xml"),
@@ -138,7 +140,7 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
         AssertOption(remoteArgs, "-analyzeduration", "200M");
         AssertOption(remoteArgs, "-probesize", "1G");
         AssertOptionPair(remoteArgs, "-map", "0:0");
-        AssertOptionPair(remoteArgs, "-map", "0:1");
+        Assert.DoesNotContain("0:1", remoteArgs);
         AssertOption(remoteArgs, "-map_metadata", "-1");
         AssertOption(remoteArgs, "-map_chapters", "-1");
         AssertOption(remoteArgs, "-threads", "0");
@@ -150,14 +152,19 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
         Assert.DoesNotContain("-copyts", remoteArgs);
         Assert.DoesNotContain("-avoid_negative_ts", remoteArgs);
         Assert.DoesNotContain("-start_at_zero", remoteArgs);
-        AssertOption(remoteArgs, "-max_muxing_queue_size", "2048");
-        AssertOption(remoteArgs, "-hls_time", "3");
-        AssertOption(remoteArgs, "-hls_segment_type", "fmp4");
-        AssertOption(remoteArgs, "-hls_segment_filename", "{outputRoot}/segment%d.ts");
+        Assert.DoesNotContain("-max_muxing_queue_size", remoteArgs);
+        AssertOption(remoteArgs, "-f", "mpegts");
+        Assert.Equal("pipe:1", remoteArgs[^1]);
+        Assert.DoesNotContain("-hls_time", remoteArgs);
+        Assert.DoesNotContain("-hls_segment_filename", remoteArgs);
+        Assert.Contains("-an", remoteArgs);
         Assert.DoesNotContain("0:a:0?", remoteArgs);
         Assert.DoesNotContain("-preset", remoteArgs);
         Assert.DoesNotContain("-crf", remoteArgs);
         Assert.Equal(0, _android.LastBodyLength);
+        Assert.Contains("-max_muxing_queue_size 2048", fallbackLog.Stdout);
+        Assert.Contains("-hls_time 3", fallbackLog.Stdout);
+        Assert.Contains("-hls_segment_filename", fallbackLog.Stdout);
     }
 
     [Fact]
@@ -179,11 +186,14 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
         AssertOption(remoteArgs, "-analyzeduration", "200M");
         AssertOption(remoteArgs, "-probesize", "1G");
         AssertOptionPair(remoteArgs, "-map", "0:0");
-        AssertOptionPair(remoteArgs, "-map", "0:1");
+        Assert.DoesNotContain("0:1", remoteArgs);
         AssertOption(remoteArgs, "-force_key_frames", "expr:gte(t,n_forced*3)");
         Assert.DoesNotContain("-t", remoteArgs);
         Assert.DoesNotContain("-sc_threshold", remoteArgs);
-        AssertOption(remoteArgs, "-hls_segment_filename", "{outputRoot}/segment%d.ts");
+        AssertOption(remoteArgs, "-f", "mpegts");
+        Assert.Equal("pipe:1", remoteArgs[^1]);
+        Assert.DoesNotContain("-hls_segment_filename", remoteArgs);
+        Assert.Contains("-an", remoteArgs);
         Assert.DoesNotContain("0:a:0?", remoteArgs);
     }
 
@@ -209,11 +219,14 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
         Assert.DoesNotContain("-ss", remoteArgs);
         Assert.DoesNotContain("-noaccurate_seek", remoteArgs);
         Assert.DoesNotContain("-t", remoteArgs);
-        AssertOption(remoteArgs, "-start_number", "30");
+        Assert.DoesNotContain("-start_number", remoteArgs);
         Assert.DoesNotContain("-copyts", remoteArgs);
         Assert.DoesNotContain("-avoid_negative_ts", remoteArgs);
         Assert.DoesNotContain("-start_at_zero", remoteArgs);
         Assert.Equal(0, _android.LastBodyLength);
+        Assert.Contains("-start_number 30", fallbackLog.Stdout);
+        Assert.Contains("-copyts", fallbackLog.Stdout);
+        Assert.Contains("-avoid_negative_ts disabled", fallbackLog.Stdout);
     }
 
     [Fact]
@@ -253,6 +266,32 @@ public sealed class JellyfinContainerTests : IAsyncLifetime
 
         using HttpResponseMessage forbidden = await client.GetAsync("/AndroidTranscoder/Source/" + SignSourceTicket("/etc/passwd"), CancellationToken.None);
         Assert.Equal(HttpStatusCode.Forbidden, forbidden.StatusCode);
+    }
+
+    [Fact]
+    public async Task SeekedSourceEndpointPreservesTimelineAndSendsOnlyVideo()
+    {
+        await WaitForLogAsync("Core startup complete", TimeSpan.FromSeconds(60));
+
+        using HttpClient client = new()
+        {
+            BaseAddress = new Uri($"http://127.0.0.1:{_jellyfin.GetMappedPublicPort(8096)}")
+        };
+
+        using HttpResponseMessage response = await client.GetAsync(
+            "/AndroidTranscoder/Source/" + SignSourceTicket(ContainerInputPath) + "?ss=00%3A01%3A21.000",
+            CancellationToken.None);
+        var body = await response.Content.ReadAsStringAsync(CancellationToken.None);
+        var sourceLog = await AssertContainerSuccess(["cat", ContainerSourceLogPath]);
+
+        response.EnsureSuccessStatusCode();
+        Assert.Equal("seeked-video-stream", body);
+        Assert.Contains("-copyts", sourceLog.Stdout);
+        Assert.Contains("-ss 00:01:21.000", sourceLog.Stdout);
+        Assert.Contains("-map 0:v:0", sourceLog.Stdout);
+        Assert.Contains("-avoid_negative_ts disabled", sourceLog.Stdout);
+        Assert.DoesNotContain("0:a", sourceLog.Stdout);
+        Assert.DoesNotContain("0:s", sourceLog.Stdout);
     }
 
     private async Task<ExecResult> AssertContainerSuccess(IList<string> command)
@@ -424,6 +463,11 @@ libswscale      8.  3.100 /  8.  3.100
 libswresample   5.  3.100 /  5.  3.100
 libpostproc    58.  3.100 / 58.  3.100
 VERSION
+  exit 0
+fi
+if [[ "${*: -1}" == "pipe:1" ]]; then
+  printf '%s\n' "$*" >> "{{ContainerSourceLogPath}}"
+  printf 'seeked-video-stream'
   exit 0
 fi
 printf '%s\n' "$*" >> "{{ContainerFallbackLogPath}}"
