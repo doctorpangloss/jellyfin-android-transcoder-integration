@@ -70,19 +70,14 @@ dotnet test tests/JellyfinAndroidTranscoder.IntegrationTests/JellyfinAndroidTran
 
 When `JFAT_ANDROID_TARGET=real`, the test installs the same app bundle on the selected device, forwards local port `18098` to the app's port `8098`, starts the foreground service with the test token, and writes the Jellyfin plugin configuration with `UseHardwareCodecs=true`.
 
-## Deployment Relevance
+## Install The Verified Release
 
-This repo is not installed on production systems. It exists to prove that the release artifacts in `doctorpangloss/jellyfin-android-transcoder` work together with Jellyfin and Android as deployed components.
+This repository is only the test harness. To install `v1.1.13`:
 
-For actual deployment, use the verified `v1.1.13` release assets from:
+1. Install the [APK](https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/latest/download/jellyfin-android-transcoder-1.1.13.apk) on the phone and open **Android Transcoder**.
+2. Add the [plugin manifest](https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/latest/download/manifest.json) under **Jellyfin Dashboard -> Plugins -> Manage Repositories**.
+3. Install **Android Transcoder** from **Available Plugins** and restart Jellyfin.
+4. Open **Dashboard -> Plugins -> Android Transcoder**.
+5. On the phone, tap **Pair from QR** and scan the code shown by Jellyfin.
 
-```text
-https://github.com/doctorpangloss/jellyfin-android-transcoder/releases/tag/v1.1.13
-```
-
-Install:
-
-- `jellyfin-android-transcoder-1.1.13.apk` or `jellyfin-android-transcoder-1.1.13.aab` on the Android phone.
-- `Jellyfin.Plugin.AndroidTranscoder-1.1.13.zip` on the Jellyfin server.
-
-The component repository README contains the Docker Compose and ADB/sideload deployment instructions.
+The [component README](https://github.com/doctorpangloss/jellyfin-android-transcoder#install-the-verified-release) shows each Jellyfin screen.
